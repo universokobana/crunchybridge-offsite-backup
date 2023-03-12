@@ -1,0 +1,140 @@
+#!/bin/bash
+
+# Slack from https://github.com/rockymadden/slack-cli
+
+# terminate script as soon as any command fails
+set -e
+
+BASEDIR=$(dirname "$0")
+
+if [[ -z "$TZ" ]]; then
+  TZ=UTC
+fi
+
+notify () {
+  if [[ -n "$CBOB_SLACK_CLI_TOKEN" ]] && [[ -n "$CBOB_SLACK_CHANNEL" ]]; then
+    export SLACK_CLI_TOKEN=$CBOB_SLACK_CLI_TOKEN
+    export SLACK_CHANNEL=$CBOB_SLACK_CLI_TOKEN
+    echo "Notifying Slack: $1"
+    $BASEDIR/slack chat send --text "$1" --channel "$CBOB_SLACK_CHANNEL" >/dev/null
+  else
+    echo "Notification skipped. SLACK_CLI_TOKEN not set."
+  fi
+}
+
+if [ -n "${CBOB_CONFIG_FILE}" ]; then
+  CONFIG_FILE="$CBOB_CONFIG_FILE"
+elif [ -r "${HOME}/.cb_offsite_backup" ] && [ -f "${HOME}/.cb_offsite_backup" ]; then
+  CONFIG_FILE="${HOME}/.cb_offsite_backup"
+elif [ -r "/usr/local/etc/cb_offsite_backup" ] && [ -f "/usr/local/etc/cb_offsite_backup" ]; then
+  CONFIG_FILE="/usr/local/etc/cb_offsite_backup"
+elif [ -r "/etc/cb_offsite_backup" ] && [ -f "/etc/cb_offsite_backup" ]; then
+  CONFIG_FILE="/etc/cb_offsite_backup"
+fi
+
+if [[ -z "$CONFIG_FILE" ]]; then
+  echo "Config file not found!"
+  exit 1
+fi
+
+if [ -f $CONFIG_FILE ]; then
+  echo "Reading config file $CONFIG_FILE"
+  unamestr=$(uname)
+  if [ "$unamestr" = 'Linux' ]; then
+    export $(grep -v '^#' $CONFIG_FILE | xargs -d '\n')
+  elif [ "$unamestr" = 'FreeBSD' ] || [ "$unamestr" = 'Darwin' ]; then
+    export $(grep -v '^#' $CONFIG_FILE | xargs -0)
+  fi
+fi
+
+if [[ -z "$CBOB_CRUNCHY_CLUSTERS" ]]; then
+  echo "Missing CBOB_CRUNCHY_CLUSTERS variable which must be set with the IDs of clusters from Crunchy Bridge"
+  exit 1
+fi
+
+if [[ -z "$CBOB_TARGET_PATH" ]]; then
+  echo "Missing CBOB_TARGET_PATH variable which must be set with the path where the files should be synced. Ex: $ export TARGET_PATH=/mnt/volume_backup/pgbackrest/"
+  exit 1
+fi
+
+if [[ -z "$CBOB_LOG_PATH" ]]; then
+  echo "Missing CBOB_LOG_PATH variable. Setting the default '/var/log'"
+  CBOB_LOG_PATH="/var/log"
+fi
+
+if [[ -z "$CBOB_CRUNCHY_API_KEY" ]]; then
+  echo "Missing CBOB_CRUNCHY_API_KEY variable which must be set with the token of Crunchy Bridge API"
+  echo "To create an API key go to: https://crunchybridge.com/account/api-keys"
+fi
+
+# if ! type "pgbackrest" > /dev/null; then
+#   echo "Command pgbackrest not found. You have to install this package before continuing. More info at https://pgbackrest.org/"
+#   exit 1
+# fi
+
+if ! type "aws" > /dev/null; then
+  echo "Command aws not found. You have to install the AWS CLI package before continuing. More info at https://aws.amazon.com/cli"
+  exit 1
+fi
+
+(
+  notify "Crunchy Bridge Offsite Backup started!"
+
+  IFS=',' # delimiter
+  read -ra CLUSTER_IDS <<< "$CBOB_CRUNCHY_CLUSTERS" # str is read into an array as tokens separated by IFS
+  for CLUSTER_ID in "${CLUSTER_IDS[@]}"; do # access each element of array
+    IFS=''
+
+    notify ":hourglass_flowing_sand: Starting Sync of cluster *$CLUSTER_ID*"
+
+    echo "  -> Getting Credentials for $CLUSTER_ID"
+    CREDENTIALS=$(curl -s -X POST "https://api.crunchybridge.com/clusters/$CLUSTER_ID/backup-tokens" -H "Authorization: Bearer $CBOB_CRUNCHY_API_KEY")
+
+    # Log credentials, do not do it in production
+    # echo $CREDENTIALS | jq .
+
+    AWS_CONFIG=$(echo $CREDENTIALS | jq -r '.aws')
+    if [ "$AWS_CONFIG" == "null" ]; then
+      notify ":warning: Could not get credentials for CLUSTER $CLUSTER_ID"
+      exit 1
+    fi
+
+    export AWS_REGION=$(echo $CREDENTIALS | jq -r '.aws.s3_region')
+    export AWS_SESSION_TOKEN=$(echo $CREDENTIALS | jq -r '.aws.s3_token')
+    export AWS_ACCESS_KEY_ID=$(echo $CREDENTIALS | jq -r '.aws.s3_key')
+    export AWS_SECRET_ACCESS_KEY=$(echo $CREDENTIALS | jq -r '.aws.s3_key_secret')
+
+    AWS_S3_BUCKET=$(echo $CREDENTIALS | jq -r '.aws.s3_bucket')
+    REPO_PATH=$(echo $CREDENTIALS | jq -r '.repo_path')
+    STANZA=$(echo $CREDENTIALS | jq -r '.stanza')
+
+    if [ "$REPO_PATH" == "null" ]; then
+      notify ":warning: Missing REPO_PATH for CLUSTER $CLUSTER_ID"
+      exit 1
+    fi
+
+    if [ "$STANZA" == "null" ]; then
+      notify ":warning: Missing STANZA for CLUSTER $CLUSTER_ID"
+      exit 1
+    fi
+
+    if [[ "$CBOB_DRY_RUN" == "true" ]]; then
+      echo "  -> Dry-run sync from AWS S3 to $CBOB_TARGET_PATH$REPO_PATH"
+      notify "Backup of *$CLUSTER_ID* is not running because DRY_RUN is set."
+      sudo -E aws s3 sync "s3://$AWS_S3_BUCKET$REPO_PATH/" "$CBOB_TARGET_PATH$REPO_PATH" --dryrun
+    else
+      echo "  -> Syncing from AWS S3 to $CBOB_TARGET_PATH$REPO_PATH"
+      sudo -E aws s3 sync "s3://$AWS_S3_BUCKET$REPO_PATH/" "$CBOB_TARGET_PATH$REPO_PATH"
+    fi
+
+    notify ":white_check_mark: Sync of *$CLUSTER_ID* complete"
+  done
+
+  if [[ -n "$CBOB_HEARTBEAT_URL" ]]; then
+    echo "Sending a request to the specified CBOB_HEARTBEAT_URL that the backup was created"
+    curl -s $CBOB_HEARTBEAT_URL
+    echo "heartbeat complete"
+  fi
+
+  notify ":checkered_flag: All backups complete!"
+) 2>&1 | tee -a "$CBOB_LOG_PATH/cb_offsite_backup.log"

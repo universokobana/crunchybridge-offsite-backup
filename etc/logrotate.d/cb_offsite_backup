@@ -1,0 +1,10 @@
+/var/log/cb_offsite_backup.log {
+  weekly
+  rotate 10
+  copytruncate
+  delaycompress
+  compress
+  notifempty
+  missingok
+  su admin admin
+}
