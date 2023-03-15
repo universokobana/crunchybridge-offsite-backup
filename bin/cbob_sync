@@ -36,7 +36,7 @@ function notify () {
 
 USR=$(whoami)
 if [ "$USR" != 'postgres' ]; then
-    error "$0 must be run as postgres"
+  error "$0 must be run as postgres. Run $ sudo -u postgres $0"
 fi
 
 # check if jq exists
@@ -161,12 +161,14 @@ for CLUSTER_ID in "${CLUSTER_IDS[@]}"; do # access each element of array
   info "  -> Backup size for $CLUSTER_ID: $BUCKET_SIZE"
 
   if [[ "$CBOB_DRY_RUN" == "true" ]]; then
-    info "  -> Dry-run sync from AWS S3 to $CBOB_TARGET_PATH$REPO_PATH"
+    info "  -> Dry-run sync from AWS S3 to $CBOB_TARGET_PATH"
     notify "Backup of *$CLUSTER_ID* is not running because DRY_RUN is set."
-    aws s3 sync --dryrun "s3://$AWS_S3_BUCKET$REPO_PATH/" "$CBOB_TARGET_PATH$REPO_PATH"
+    aws s3 sync --dryrun "s3://$AWS_S3_BUCKET$REPO_PATH/archive/$STANZA" "$CBOB_TARGET_PATH/archive/$STANZA"
+    aws s3 sync --dryrun "s3://$AWS_S3_BUCKET$REPO_PATH/backup/$STANZA" "$CBOB_TARGET_PATH/backup/$STANZA"
   else
-    info "  -> Syncing from AWS S3 to $CBOB_TARGET_PATH$REPO_PATH"
-    aws s3 sync --quiet "s3://$AWS_S3_BUCKET$REPO_PATH/" "$CBOB_TARGET_PATH$REPO_PATH"
+    info "  -> Syncing from AWS S3 to $CBOB_TARGET_PATH"
+    aws s3 sync "s3://$AWS_S3_BUCKET$REPO_PATH/archive/$STANZA" "$CBOB_TARGET_PATH/archive/$STANZA"
+    aws s3 sync "s3://$AWS_S3_BUCKET$REPO_PATH/backup/$STANZA" "$CBOB_TARGET_PATH/backup/$STANZA"
   fi
 
   info ":white_check_mark: Sync of *$CLUSTER_ID* complete"
