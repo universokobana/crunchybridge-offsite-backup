@@ -20,6 +20,11 @@ Run the installation script:
 
 For security reason, read the [installation script source before](https://github.com/universokobana/crunchybridge-offsite-backup/blob/main/install.sh).
 
+## Running
+
+The script will automatically run once a day, but if you need to invoke manually, run:
+
+    $ sudo cbob_sync
 ## Configuration
 
 ### Config File
