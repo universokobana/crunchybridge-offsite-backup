@@ -79,7 +79,7 @@ info "Installing Packages"
 sudo apt install -y postgresql-15 postgresql-client-15 postgresql-15-pgaudit libdbd-pg-perl pgbackrest
 
 info "Installing pgbackrest_auto with the latest version"
-sudo wget https://raw.githubusercontent.com/universokobana/pgbackrest_auto/patched/pgbackrest_auto
+sudo wget -q https://raw.githubusercontent.com/universokobana/pgbackrest_auto/patched/pgbackrest_auto
 sudo mv pgbackrest_auto /usr/local/bin/pgbackrest_auto
 sudo chown postgres:postgres /usr/local/bin/pgbackrest_auto
 sudo chmod 750 /usr/local/bin/pgbackrest_auto
@@ -145,9 +145,11 @@ sudo echo "export CRUNCHY_API_KEY=$CBOB_CRUNCHY_API_KEY" > /etc/profile.d/cbob_c
 info "Installing scripts e config files"
 info "  Copying ./bin/cbob_sync to /usr/local/bin/cbob_sync"
 sudo cp ./bin/cbob_sync /usr/local/bin/cbob_sync
+sudo chown postgres:postgres /usr/local/bin/cbob_sync
 
 info "  Copying ./bin/slack to /usr/local/bin/slack"
 sudo cp -n ./bin/slack /usr/local/bin/slack
+sudo chown postgres:postgres /usr/local/bin/slack
 
 info "  Creating config at /usr/local/etc/cb_offsite_backup"
 echo "CBOB_CRUNCHY_API_KEY=$CBOB_CRUNCHY_API_KEY
@@ -264,6 +266,9 @@ rm -f $TMP_PATH/cbob_postgres_start
 rm -f $TMP_PATH/cbob_postgres_stop
 rm -f $TMP_PATH/cbob_postgres_restart
 rm -f $TMP_PATH/pgbackrest.*.conf
+
+info "Setting chown to postgres"
+sudo chown postgres:postgres /usr/local/bin/cbob*
 
 info "Disabling postgresql service from start on boot"
 sudo systemctl disable postgresql
