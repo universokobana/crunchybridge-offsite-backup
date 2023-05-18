@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Author: Rafael Lima (https://github.com/rafaelp)
-# Dependencies: aws-cli, slack-cli, jq packages
+# Dependencies: aws-cli, slack, flock, jq packages
 
 # terminate script as soon as any command fails
 set -e
@@ -10,28 +10,35 @@ function info(){
     msg="$1"
     echo -e "$(date "+%F %T") INFO: $msg"
     logger -p user.notice -t "$(basename "$0")" "$msg"
-    if [[ -n "$CBOB_SLACK_CLI_TOKEN" ]]; then notify "$msg"; fi
+    notify "$msg"
 }
 function warning(){
     msg="$1"
     echo -e "$(date "+%F %T") \e[33mWARN:\e[0m $msg"
     logger -p user.notice -t "$(basename "$0")" "$msg"
-    if [[ -n "$CBOB_SLACK_CLI_TOKEN" ]]; then notify ":warning: $msg"; fi
+    notify ":warning: $msg"
     return 1
 }
 function error(){
     msg="$1"
     echo -e "$(date "+%F %T") \e[91mERROR:\e[0m $msg"
     logger -p user.error -t "$(basename "$0")" "$msg"
-    if [[ -n "$CBOB_SLACK_CLI_TOKEN" ]]; then notify ":octagonal_sign: $msg"; fi
+    notify ":octagonal_sign: $msg"
     # remove lock file
     if [ -f "${lock}" ]; then rm "${lock}"; fi
     exit 1
 }
 
 function notify () {
-  export SLACK_CLI_TOKEN=$CBOB_SLACK_CLI_TOKEN
-  (slack chat send --text "$1" --channel "$CBOB_SLACK_CHANNEL" >/dev/null) || true
+  if [[ -n "$CBOB_SLACK_CLI_TOKEN" ]]; then
+    export SLACK_CLI_TOKEN=$CBOB_SLACK_CLI_TOKEN
+    if ! command -v slack &> /dev/null; then
+      CBOB_SLACK_CLI_TOKEN=""
+      warning "slack could not be found. Please install the slack script in /usr/local/bin"
+      exit 1
+    fi
+    (slack chat send --text "$1" --channel "$CBOB_SLACK_CHANNEL" >/dev/null) || true
+  fi
 }
 
 USR=$(whoami)
@@ -52,7 +59,6 @@ then
     warning "flock could not be found. Please install the flock package"
     exit
 fi
-
 
 # check if aws exists
 if ! command -v aws &> /dev/null
@@ -127,6 +133,11 @@ for CLUSTER_ID in "${CLUSTER_IDS[@]}"; do # access each element of array
 
   info "Starting Sync of cluster *$CLUSTER_ID*"
 
+  info "  -> Getting Last Backup for $CLUSTER_ID"
+  LAST_BACKUP=$(curl -s -X GET "https://api.crunchybridge.com/clusters/$CLUSTER_ID/backups?limit=1&order=desc" -H "Authorization: Bearer $CBOB_CRUNCHY_API_KEY")
+  export LAST_BACKUP_NAME=$(echo $LAST_BACKUP | jq -r '.backups[0].name')
+  info "     Last backup for $CLUSTER_ID is $LAST_BACKUP_NAME"
+
   info "  -> Getting Credentials for $CLUSTER_ID"
   CREDENTIALS=$(curl -s -X POST "https://api.crunchybridge.com/clusters/$CLUSTER_ID/backup-tokens" -H "Authorization: Bearer $CBOB_CRUNCHY_API_KEY")
 
@@ -155,16 +166,16 @@ for CLUSTER_ID in "${CLUSTER_IDS[@]}"; do # access each element of array
     warning "Missing STANZA for CLUSTER $CLUSTER_ID"
   fi
 
-  info "  -> Calculating backup size for $CLUSTER_ID..."
-  LS_OUTPUT=$(aws s3 ls --summarize --human-readable --recursive "s3://$AWS_S3_BUCKET$REPO_PATH/")
-  BUCKET_SIZE=$(echo "$LS_OUTPUT" | grep 'Total Size:' | cut -f2 -d":" | xargs)
-  info "  -> Backup size for $CLUSTER_ID: $BUCKET_SIZE"
+  # info "  -> Calculating backup size for $CLUSTER_ID..."
+  # LS_OUTPUT=$(aws s3 ls --summarize --human-readable --recursive "s3://$AWS_S3_BUCKET$REPO_PATH/archive/$STANZA/$LAST_BACKUP_NAME")
+  # BUCKET_SIZE=$(echo "$LS_OUTPUT" | grep 'Archive Total Size:' | cut -f2 -d":" | xargs)
+  # info "  -> Backup size for $CLUSTER_ID: $BUCKET_SIZE"
 
   if [[ "$CBOB_DRY_RUN" == "true" ]]; then
     info "  -> Dry-run sync from AWS S3 to $CBOB_TARGET_PATH"
     notify "Backup of *$CLUSTER_ID* is not running because DRY_RUN is set."
-    aws s3 sync --dryrun "s3://$AWS_S3_BUCKET$REPO_PATH/archive/$STANZA" "$CBOB_TARGET_PATH/archive/$STANZA"
-    aws s3 sync --dryrun "s3://$AWS_S3_BUCKET$REPO_PATH/backup/$STANZA" "$CBOB_TARGET_PATH/backup/$STANZA"
+    aws s3 sync --dryrun "s3://$AWS_S3_BUCKET$REPO_PATH/archive/$STANZA/$LAST_BACKUP_NAME" "$CBOB_TARGET_PATH/archive/$STANZA/$LAST_BACKUP_NAME"
+    aws s3 sync --dryrun "s3://$AWS_S3_BUCKET$REPO_PATH/backup/$STANZA/$LAST_BACKUP_NAME" "$CBOB_TARGET_PATH/backup/$STANZA/$LAST_BACKUP_NAME"
   else
     info "  -> Syncing from AWS S3 to $CBOB_TARGET_PATH"
     aws s3 sync "s3://$AWS_S3_BUCKET$REPO_PATH/archive/$STANZA" "$CBOB_TARGET_PATH/archive/$STANZA"
