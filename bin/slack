@@ -29,9 +29,9 @@ case "${cmd}${1}" in
 esac
 
 # PIPE FRIENDLINESS ###############################################################################
-case "${cmd}${sub}" in
-  chatsend|chatupdate|fileupload) [ -p /dev/stdin ] && stdin=$(cat <&0) ;;
-esac
+# case "${cmd}${sub}" in
+#   chatsend|chatupdate|fileupload) [ -p /dev/stdin ] && stdin=$(cat <&0) ;;
+# esac
 
 # ARGUMENT AND OPTION PARSING #####################################################################
 while (( "$#" )); do
