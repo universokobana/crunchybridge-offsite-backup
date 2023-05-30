@@ -282,11 +282,13 @@ cp $TMP_PATH/pgbackrest.conf /etc/pgbackrest/pgbackrest.conf
 
 info "Adding automatic sync to cron"
 rm -f /etc/cron.d/cbob_sync_and_expire
+echo "PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin" >> /etc/cron.d/cbob_sync_and_expire
 echo "# Crunchy Data Offsite Backup" >> /etc/cron.d/cbob_sync_and_expire
 echo "00 06 * * * root /usr/local/bin/cbob_sync_and_expire" >> /etc/cron.d/cbob_sync_and_expire
 
 info "Adding automatic restore to cron"
 rm -f /etc/cron.d/cbob_restore_check
+echo "PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin" >> /etc/cron.d/cbob_restore_check
 echo "# Crunchy Data Offsite Backup" >> /etc/cron.d/cbob_restore_check
 echo "00 18 * * * root /usr/local/bin/cbob_restore_check" >> /etc/cron.d/cbob_restore_check
 
