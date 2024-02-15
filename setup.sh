@@ -222,6 +222,14 @@ echo "#!/bin/bash" > "$TMP_PATH/bin/cbob_postgres_start"
 echo "#!/bin/bash" > "$TMP_PATH/bin/cbob_postgres_stop"
 echo "#!/bin/bash" > "$TMP_PATH/bin/cbob_postgres_restart"
 
+echo "[global]
+start-fast=y
+log-level-file=detail
+log-path=$CBOB_BASE_PATH/log/pgbackrest
+repo1-retention-full=$CBOB_RETENTION_FULL
+repo1-path=$CBOB_BASE_PATH/crunchybridge
+" > "$TMP_PATH/pgbackrest.conf"
+
 port_counter=5432
 
 IFS=',' # delimiter
@@ -257,14 +265,6 @@ for CLUSTER_ID in "${CLUSTER_IDS[@]}"; do # access each element of array
   echo "sudo -u postgres pgbackrest --stanza=$STANZA check"  >> "$TMP_PATH/bin/cbob_check"
   echo "sudo -u postgres pgbackrest --stanza=$STANZA info"  >> "$TMP_PATH/bin/cbob_info"
   echo "sudo -u postgres pgbackrest --stanza=$STANZA expire"  >> "$TMP_PATH/bin/cbob_expire"
-
-  echo "[global]
-start-fast=y
-log-level-file=detail
-log-path=$CBOB_BASE_PATH/log/pgbackrest
-repo1-retention-full=$CBOB_RETENTION_FULL
-repo1-path=$CBOB_BASE_PATH/crunchybridge
-" > "$TMP_PATH/pgbackrest.conf"
 
   echo "[$STANZA]
 pg1-path=$CBOB_BASE_PATH/postgresql/15/$CLUSTER_ID
