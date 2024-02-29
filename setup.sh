@@ -109,7 +109,6 @@ info "Creating pgBackRest config files & directories"
 mkdir -p -m 770 /var/log/pgbackrest
 chown postgres:postgres /var/log/pgbackrest
 mkdir -p /etc/pgbackrest
-mkdir -p /etc/pgbackrest/conf.d
 chown postgres:postgres -R /etc/pgbackrest
 mkdir -p /tmp/pgbackrest
 chown postgres:postgres -R /tmp/pgbackrest
