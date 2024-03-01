@@ -81,7 +81,10 @@ function error(){
     logger -p user.error -t "$(basename "$0")" "$msg"
     notify_slack ":octagonal_sign: $msg"
     # heartbeat
-    curl -s https://cronitor.link/p/13928ea664c147f4b8bb47ffa8dd3e25/pWPGM5?state=fail
+    if [[ -n "$CBOB_RESTORE_HEARTBEAT_URL" ]]; then
+      info "Sending a request to the specified CBOB_RESTORE_HEARTBEAT_URL that an error ocurred :("
+      curl -s "$CBOB_RESTORE_HEARTBEAT_URL?state=fail"
+    fi
     # sendmail
     if [[ "${REPORT}" = "yes" ]]; then notify; fi
     # remove lock file
@@ -808,10 +811,16 @@ fi
 if grep -q 0 "${status_file}"; then
     notify_slack ":thumbsdown::skin-tone-3: At least one check failed"
     sed -i 's/Result_status=1/Result_status=0/g' "${status_file}"
-    curl -s https://cronitor.link/p/13928ea664c147f4b8bb47ffa8dd3e25/pWPGM5?state=fail
+    if [[ -n "$CBOB_RESTORE_HEARTBEAT_URL" ]]; then
+      info "Sending a request to the specified CBOB_RESTORE_HEARTBEAT_URL that the restore check failed :("
+      curl -s "$CBOB_RESTORE_HEARTBEAT_URL?state=fail"
+    fi
 else
   notify_slack ":white_check_mark: All checks passed!"
-  curl -s https://cronitor.link/p/13928ea664c147f4b8bb47ffa8dd3e25/pWPGM5
+  if [[ -n "$CBOB_RESTORE_HEARTBEAT_URL" ]]; then
+    info "Sending a request to the specified CBOB_RESTORE_HEARTBEAT_URL that the restore check passed!"
+    curl -s https://cronitor.link/p/13928ea664c147f4b8bb47ffa8dd3e25/pWPGM5
+  fi
 fi
 
 # remove lock file

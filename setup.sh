@@ -86,12 +86,6 @@ fi
 info "Installing main packages"
 apt install -y postgresql-15 postgresql-client-15 postgresql-15-pgaudit pgbackrest
 
-info "Installing (patched version of) pgbackrest_auto"
-wget -q https://raw.githubusercontent.com/universokobana/pgbackrest_auto/patched/pgbackrest_auto
-mv pgbackrest_auto /usr/local/bin/pgbackrest_auto
-chown postgres:postgres /usr/local/bin/pgbackrest_auto
-chmod 750 /usr/local/bin/pgbackrest_auto
-
 info "Creating admin user with sudo privileges"
 if id "admin" &>/dev/null; then
   info "  User admin already exists!"
@@ -177,6 +171,10 @@ chown postgres:postgres /usr/local/bin/cbob_sync_pg
 info "  Copying slack-cli"
 cp -n ./bin/slack /usr/local/bin/slack
 chown postgres:postgres /usr/local/bin/slack
+
+info "  Copying patched version of pgbackrest_auto"
+cp -n ./bin/pgbackrest_auto /usr/local/bin/pgbackrest_auto
+chown postgres:postgres /usr/local/bin/pgbackrest_auto
 
 info "  Creating config at /usr/local/etc/cb_offsite_backup"
 echo "CBOB_CRUNCHY_API_KEY=$CBOB_CRUNCHY_API_KEY
