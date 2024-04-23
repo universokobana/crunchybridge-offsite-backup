@@ -819,7 +819,7 @@ else
   notify_slack ":white_check_mark: All checks passed!"
   if [[ -n "$CBOB_RESTORE_HEARTBEAT_URL" ]]; then
     info "Sending a request to the specified CBOB_RESTORE_HEARTBEAT_URL that the restore check passed!"
-    curl -s https://cronitor.link/p/13928ea664c147f4b8bb47ffa8dd3e25/pWPGM5
+    curl -s $CBOB_RESTORE_HEARTBEAT_URL
   fi
 fi
 
