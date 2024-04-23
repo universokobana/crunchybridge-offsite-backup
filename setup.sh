@@ -23,57 +23,63 @@ function error(){
     exit 1
 }
 
-if [[ -z "$CBOB_CRUNCHY_API_KEY" ]]; then
-  read -re -p 'Please inform your Crunch Bridge API Key: ' -i '' CBOB_CRUNCHY_API_KEY
-  if [ "$CBOB_CRUNCHY_API_KEY" == "" ]; then
-    error "Invalid API Key"
+# Load config file if exists to determine the default values
+if [ -n "${CBOB_CONFIG_FILE}" ]; then
+  CONFIG_FILE="$CBOB_CONFIG_FILE"
+elif [ -r "${HOME}/.cb_offsite_backup" ] && [ -f "${HOME}/.cb_offsite_backup" ]; then
+  CONFIG_FILE="${HOME}/.cb_offsite_backup"
+elif [ -r "/usr/local/etc/cb_offsite_backup" ] && [ -f "/usr/local/etc/cb_offsite_backup" ]; then
+  CONFIG_FILE="/usr/local/etc/cb_offsite_backup"
+elif [ -r "/etc/cb_offsite_backup" ] && [ -f "/etc/cb_offsite_backup" ]; then
+  CONFIG_FILE="/etc/cb_offsite_backup"
+fi
+
+if [ -f $CONFIG_FILE ]; then
+  info "Reading existing config file $CONFIG_FILE"
+  unamestr=$(uname)
+  if [ "$unamestr" = 'Linux' ]; then
+    export $(grep -v '^#' $CONFIG_FILE | xargs -d '\n')
+  elif [ "$unamestr" = 'FreeBSD' ] || [ "$unamestr" = 'Darwin' ]; then
+    export $(grep -v '^#' $CONFIG_FILE | xargs -0)
   fi
 fi
 
-if [[ -z "$CBOB_SLACK_CLI_TOKEN" ]]; then
-  read -re -p 'Please inform your Slack CLI Token (leave blank if will not use): ' -i '' CBOB_SLACK_CLI_TOKEN
+read -re -p 'Which version of PostgreSQL do you use: ' -i "${CBOB_PG_VERSION:-16}" CBOB_PG_VERSION
+if [ "$CBOB_PG_VERSION" != "15" ] && [ "$CBOB_PG_VERSION" != "16" ]; then
+  error "Invalid version, choose 15 or 16"
 fi
+
+read -re -p 'Please inform your Crunch Bridge API Key: ' -i "$CBOB_CRUNCHY_API_KEY" CBOB_CRUNCHY_API_KEY
+if [ "$CBOB_CRUNCHY_API_KEY" == "" ]; then
+  error "Invalid API Key"
+fi
+
+read -re -p 'Please inform your Slack CLI Token (leave blank if will not use): ' -i "$CBOB_SLACK_CLI_TOKEN" CBOB_SLACK_CLI_TOKEN
 if [ "$CBOB_SLACK_CLI_TOKEN" == "" ]; then
   warning 'No Slack Token given, this feature will be disabled.'
 else
-  if [[ -z "$CBOB_SLACK_CHANNEL" ]]; then
-    read -re -p 'Slack channel to send logs: ' -i '#backup-log' CBOB_SLACK_CHANNEL
-    if [ "$CBOB_SLACK_CHANNEL" == "" ]; then
-      error 'A channel must be given'
-    fi
+  read -re -p 'Slack channel to send logs: ' -i "${CBOB_SLACK_CHANNEL:-#backup-log}" CBOB_SLACK_CHANNEL
+  if [ "$CBOB_SLACK_CHANNEL" == "" ]; then
+    error 'A channel must be given'
   fi
 fi
 
-if [[ -z "$CBOB_CRUNCHY_CLUSTERS" ]]; then
-  read -re -p 'Please paste the list of cluter ids separated by comma: ' -i '' CBOB_CRUNCHY_CLUSTERS
-  if [ "$CBOB_CRUNCHY_CLUSTERS" == "" ]; then
-    error "Invalid Cluster IDs"
-  fi
+read -re -p 'Please paste the list of cluter ids separated by comma: ' -i "$CBOB_CRUNCHY_CLUSTERS" CBOB_CRUNCHY_CLUSTERS
+if [ "$CBOB_CRUNCHY_CLUSTERS" == "" ]; then
+  error "Invalid Cluster IDs"
 fi
 
-if [[ -z "$CBOB_RETENTION_FULL" ]]; then
-  read -re -p 'How many full backups you would like to retain: ' -i '7' CBOB_RETENTION_FULL
-fi
+read -re -p 'How many full backups you would like to retain: ' -i "${CBOB_RETENTION_FULL:-1}" CBOB_RETENTION_FULL
 
-if [[ -z "$CBOB_BASE_PATH" ]]; then
-  read -re -p 'Path where Crunchy Bridge Offsite Backup data will reside: ' -i '/mnt/volume_cbob' CBOB_BASE_PATH
-  echo "Crunchy Bridge Offsite Backup repository path: $CBOB_BASE_PATH"
-fi
+read -re -p 'Path where Crunchy Bridge Offsite Backup data will reside: ' -i "${CBOB_BASE_PATH:-/mnt/volume_cbob}" CBOB_BASE_PATH
+echo "Crunchy Bridge Offsite Backup repository path: $CBOB_BASE_PATH"
 
-if [[ -z "$CBOB_SYNC_HEARTBEAT_URL" ]]; then
-  read -re -p 'Heartbeart URL for Sync (Ex: https://cronitor.link/p/137ffa8d47f4b8d3e29285ea664c1bb4/TnWICU): ' -i '' CBOB_SYNC_HEARTBEAT_URL
-fi
+read -re -p 'Heartbeart URL for Sync (Ex: https://cronitor.link/p/137ffa8d47f4b8d3e29285ea664c1bb4/TnWICU): ' -i "$CBOB_SYNC_HEARTBEAT_URL" CBOB_SYNC_HEARTBEAT_URL
 
-if [[ -z "$CBOB_RESTORE_HEARTBEAT_URL" ]]; then
-  read -re -p 'Heartbeart URL for Restore (Ex: https://cronitor.link/p/137ffa8d47f4b8d3e29285ea664c1bb4/TnWICU): ' -i '' CBOB_RESTORE_HEARTBEAT_URL
-fi
-
-if [[ -z "$CBOB_PG_VERSION" ]]; then
-  read -re -p 'Which version of PostgreSQL do you use: ' -i '16' CBOB_PG_VERSION
-fi
+read -re -p 'Heartbeart URL for Restore (Ex: https://cronitor.link/p/137ffa8d47f4b8d3e29285ea664c1bb4/TnWICU): ' -i "$CBOB_RESTORE_HEARTBEAT_URL" CBOB_RESTORE_HEARTBEAT_URL
 
 info "Updating and upgrading packages"
-apt update && apt upgrade -y
+apt update && apt upgrade -y && apt autoremove -y
 
 info "Installing dependencies"
 apt install software-properties-common apt-transport-https wget curl ca-certificates gnupg jq unzip sendemail -y
@@ -195,8 +201,11 @@ cp -n ./bin/pgbackrest_auto /usr/local/bin/pgbackrest_auto
 chown postgres:postgres /usr/local/bin/pgbackrest_auto
 
 info "  Creating config at /usr/local/etc/cb_offsite_backup"
-echo "CBOB_CRUNCHY_API_KEY=$CBOB_CRUNCHY_API_KEY
+echo "CBOB_PG_VERSION=$CBOB_PG_VERSION
+CBOB_CRUNCHY_API_KEY=$CBOB_CRUNCHY_API_KEY
 CBOB_CRUNCHY_CLUSTERS=$CBOB_CRUNCHY_CLUSTERS
+CBOB_RETENTION_FULL=$CBOB_RETENTION_FULL
+CBOB_BASE_PATH=$CBOB_BASE_PATH
 CBOB_TARGET_PATH=$CBOB_BASE_PATH/crunchybridge
 CBOB_LOG_PATH=$CBOB_BASE_PATH/log/cbob" > /usr/local/etc/cb_offsite_backup
 if [ -n "${CBOB_SLACK_CLI_TOKEN}" ]; then
