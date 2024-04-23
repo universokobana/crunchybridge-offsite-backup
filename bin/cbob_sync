@@ -191,9 +191,9 @@ for CLUSTER_ID in "${CLUSTER_IDS[@]}"; do # access each element of array
   info ":white_check_mark: Sync of *$CLUSTER_ID* complete"
 done
 
-if [[ -n "$CBOB_HEARTBEAT_URL" ]]; then
-  info "Sending a request to the specified CBOB_HEARTBEAT_URL that the backup was created"
-  curl -s $CBOB_HEARTBEAT_URL
+if [[ -n "$CBOB_SYNC_HEARTBEAT_URL" ]]; then
+  info "Sending a request to the specified CBOB_SYNC_HEARTBEAT_URL that the backup was created"
+  curl -s $CBOB_SYNC_HEARTBEAT_URL
   info "heartbeat complete"
 fi
 

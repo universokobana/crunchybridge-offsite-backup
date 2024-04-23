@@ -60,6 +60,18 @@ if [[ -z "$CBOB_BASE_PATH" ]]; then
   echo "Crunchy Bridge Offsite Backup repository path: $CBOB_BASE_PATH"
 fi
 
+if [[ -z "$CBOB_SYNC_HEARTBEAT_URL" ]]; then
+  read -re -p 'Heartbeart URL for Sync (Ex: https://cronitor.link/p/137ffa8d47f4b8d3e29285ea664c1bb4/TnWICU): ' -i '' CBOB_SYNC_HEARTBEAT_URL
+fi
+
+if [[ -z "$CBOB_RESTORE_HEARTBEAT_URL" ]]; then
+  read -re -p 'Heartbeart URL for Restore (Ex: https://cronitor.link/p/137ffa8d47f4b8d3e29285ea664c1bb4/TnWICU): ' -i '' CBOB_RESTORE_HEARTBEAT_URL
+fi
+
+if [[ -z "$CBOB_PG_VERSION" ]]; then
+  read -re -p 'Which version of PostgreSQL do you use: ' -i '16' CBOB_PG_VERSION
+fi
+
 info "Updating and upgrading packages"
 apt update && apt upgrade -y
 
@@ -84,7 +96,13 @@ if [ ! -f /etc/apt/sources.list.d/pgdg.list ]; then
 fi
 
 info "Installing main packages"
-apt install -y postgresql-15 postgresql-client-15 postgresql-15-pgaudit pgbackrest
+if [ $CBOB_PG_VERSION = '15' ]; then
+  apt install -y postgresql-15 postgresql-client-15 postgresql-15-pgaudit pgbackrest
+elif [ $CBOB_PG_VERSION = '16' ]; then
+  apt install -y postgresql-16 postgresql-client-16 postgresql-16-pgaudit pgbackrest
+else
+  error "Invalid PostgreSQL version"
+fi
 
 info "Creating admin user with sudo privileges"
 if id "admin" &>/dev/null; then
@@ -136,8 +154,8 @@ chmod 750 $CBOB_BASE_PATH/restores
 chown postgres:postgres $CBOB_BASE_PATH/restores
 
 info "Creating directory for postgresql data (used by manual restores)"
-mkdir -p $CBOB_BASE_PATH/postgresql/15
-chmod 750 $CBOB_BASE_PATH/postgresql/15
+mkdir -p $CBOB_BASE_PATH/postgresql/$CBOB_PG_VERSION
+chmod 750 $CBOB_BASE_PATH/postgresql/$CBOB_PG_VERSION
 chown postgres:postgres -R $CBOB_BASE_PATH/postgresql
 
 info "Creating directory for CBOB logs"
@@ -184,6 +202,12 @@ CBOB_LOG_PATH=$CBOB_BASE_PATH/log/cbob" > /usr/local/etc/cb_offsite_backup
 if [ -n "${CBOB_SLACK_CLI_TOKEN}" ]; then
   echo "CBOB_SLACK_CLI_TOKEN=$CBOB_SLACK_CLI_TOKEN
 CBOB_SLACK_CHANNEL=$CBOB_SLACK_CHANNEL" >> /usr/local/etc/cb_offsite_backup
+fi
+if [ -n "${CBOB_SYNC_HEARTBEAT_URL}" ]; then
+  echo "CBOB_SYNC_HEARTBEAT_URL=$CBOB_SYNC_HEARTBEAT_URL" >> /usr/local/etc/cb_offsite_backup
+fi
+if [ -n "${CBOB_RESTORE_HEARTBEAT_URL}" ]; then
+  echo "CBOB_RESTORE_HEARTBEAT_URL=$CBOB_RESTORE_HEARTBEAT_URL" >> /usr/local/etc/cb_offsite_backup
 fi
 
 info "  Configuring logrotate"
@@ -244,27 +268,27 @@ for CLUSTER_ID in "${CLUSTER_IDS[@]}"; do # access each element of array
   info "  -> Stanza $STANZA"
 
   info "  Initializing database for cluster $CLUSTER_ID"
-  rm -rf $CBOB_BASE_PATH/postgresql/15/$CLUSTER_ID
-  sudo -u postgres /usr/lib/postgresql/15/bin/initdb -D $CBOB_BASE_PATH/postgresql/15/$CLUSTER_ID
+  rm -rf $CBOB_BASE_PATH/postgresql/$CBOB_PG_VERSION/$CLUSTER_ID
+  sudo -u postgres /usr/lib/postgresql/$CBOB_PG_VERSION/bin/initdb -D $CBOB_BASE_PATH/postgresql/$CBOB_PG_VERSION/$CLUSTER_ID
 
   info "  Updating postgresql.conf cluster $CLUSTER_ID"
-  mv $CBOB_BASE_PATH/postgresql/15/$CLUSTER_ID/postgresql.conf $CBOB_BASE_PATH/postgresql/15/$CLUSTER_ID/postgresql.default.conf
-  cp ./etc/postgresql.template.conf $CBOB_BASE_PATH/postgresql/15/$CLUSTER_ID/postgresql.conf
-  sed -i -e "s/{{stanza}}/$STANZA/g" $CBOB_BASE_PATH/postgresql/15/$CLUSTER_ID/postgresql.conf
-  sed -i -e "s/{{port}}/$port_counter/g" $CBOB_BASE_PATH/postgresql/15/$CLUSTER_ID/postgresql.conf
-  chown postgres:postgres $CBOB_BASE_PATH/postgresql/15/$CLUSTER_ID/postgresql.conf
+  mv $CBOB_BASE_PATH/postgresql/$CBOB_PG_VERSION/$CLUSTER_ID/postgresql.conf $CBOB_BASE_PATH/postgresql/$CBOB_PG_VERSION/$CLUSTER_ID/postgresql.default.conf
+  cp ./etc/postgresql.template.conf $CBOB_BASE_PATH/postgresql/$CBOB_PG_VERSION/$CLUSTER_ID/postgresql.conf
+  sed -i -e "s/{{stanza}}/$STANZA/g" $CBOB_BASE_PATH/postgresql/$CBOB_PG_VERSION/$CLUSTER_ID/postgresql.conf
+  sed -i -e "s/{{port}}/$port_counter/g" $CBOB_BASE_PATH/postgresql/$CBOB_PG_VERSION/$CLUSTER_ID/postgresql.conf
+  chown postgres:postgres $CBOB_BASE_PATH/postgresql/$CBOB_PG_VERSION/$CLUSTER_ID/postgresql.conf
 
   info "  Adding cluster $CLUSTER_ID to script files"
-  echo "sudo -u postgres /usr/lib/postgresql/15/bin/pg_ctl -D $CBOB_BASE_PATH/postgresql/15/$CLUSTER_ID -l $CBOB_BASE_PATH/log/postgresql/postgresql-15-$CLUSTER_ID.log start" >> "$TMP_PATH/bin/cbob_postgres_start"
-  echo "sudo -u postgres /usr/lib/postgresql/15/bin/pg_ctl -D $CBOB_BASE_PATH/postgresql/15/$CLUSTER_ID -l $CBOB_BASE_PATH/log/postgresql/postgresql-15-$CLUSTER_ID.log stop" >> "$TMP_PATH/bin/cbob_postgres_stop"
-  echo "sudo -u postgres /usr/lib/postgresql/15/bin/pg_ctl -D $CBOB_BASE_PATH/postgresql/15/$CLUSTER_ID -l $CBOB_BASE_PATH/log/postgresql/postgresql-15-$CLUSTER_ID.log restart" >> "$TMP_PATH/bin/cbob_postgres_restart"
+  echo "sudo -u postgres /usr/lib/postgresql/$CBOB_PG_VERSION/bin/pg_ctl -D $CBOB_BASE_PATH/postgresql/$CBOB_PG_VERSION/$CLUSTER_ID -l $CBOB_BASE_PATH/log/postgresql/postgresql-$CBOB_PG_VERSION-$CLUSTER_ID.log start" >> "$TMP_PATH/bin/cbob_postgres_start"
+  echo "sudo -u postgres /usr/lib/postgresql/$CBOB_PG_VERSION/bin/pg_ctl -D $CBOB_BASE_PATH/postgresql/$CBOB_PG_VERSION/$CLUSTER_ID -l $CBOB_BASE_PATH/log/postgresql/postgresql-$CBOB_PG_VERSION-$CLUSTER_ID.log stop" >> "$TMP_PATH/bin/cbob_postgres_stop"
+  echo "sudo -u postgres /usr/lib/postgresql/$CBOB_PG_VERSION/bin/pg_ctl -D $CBOB_BASE_PATH/postgresql/$CBOB_PG_VERSION/$CLUSTER_ID -l $CBOB_BASE_PATH/log/postgresql/postgresql-$CBOB_PG_VERSION-$CLUSTER_ID.log restart" >> "$TMP_PATH/bin/cbob_postgres_restart"
   echo "sudo -u postgres pgbackrest_auto --from=$STANZA --to=$CBOB_BASE_PATH/restores/$STANZA --checkdb --clear --report --config=/etc/pgbackrest/pgbackrest.conf" >> "$TMP_PATH/bin/cbob_restore_check"
   echo "sudo -u postgres pgbackrest --stanza=$STANZA check"  >> "$TMP_PATH/bin/cbob_check"
   echo "sudo -u postgres pgbackrest --stanza=$STANZA info"  >> "$TMP_PATH/bin/cbob_info"
   echo "sudo -u postgres pgbackrest --stanza=$STANZA expire"  >> "$TMP_PATH/bin/cbob_expire"
 
   echo "[$STANZA]
-pg1-path=$CBOB_BASE_PATH/postgresql/15/$CLUSTER_ID
+pg1-path=$CBOB_BASE_PATH/postgresql/$CBOB_PG_VERSION/$CLUSTER_ID
 pg1-port=$port_counter
 " >> "$TMP_PATH/pgbackrest.conf"
 

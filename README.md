@@ -56,7 +56,7 @@ CBOB_TARGET_PATH=/mnt/crunchy_bridge_backups
 CBOB_LOG_PATH=/var/log/
 CBOB_SLACK_CLI_TOKEN=xoxb-9999999999-9999999999999-xxxxxxxxxxxxxxxxxxxxxxxx
 CBOB_SLACK_CHANNEL=#backup-log
-CBOB_HEARTBEAT_URL=https://myserver.com/path-to-post
+CBOB_SYNC_HEARTBEAT_URL=https://myserver.com/path-to-post
 ```
 
 #### Via Environment Variables
@@ -138,7 +138,7 @@ app with a [Slack API token](https://api.slack.com/web).
 It uses the [slack-cli](https://github.com/rockymadden/slack-cli) that is bundled with this installation.
 #### Heartbeat
 
-You can add a `CBOB_HEARTBEAT_URL` to the script so a request gets sent every time a backup is made.
+You can add a `CBOB_SYNC_HEARTBEAT_URL` to the script so a request gets sent every time a backup is made.
 
 #### Timezone
 
