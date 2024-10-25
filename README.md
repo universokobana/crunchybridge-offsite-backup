@@ -5,6 +5,7 @@ This project syncs the AWS S3 backup repo from [Crunchy Bridge](https://crunchyb
 An off-site backup is a copy of a business production system data that is stored in a different location than the production system, ussualy in a third-party provider. If you use AWS, you should do off-site backup to Digital Ocean, for example. Doesn't make sense to backup Heroku data (that uses AWS) in AWS S3 for example, because in that case you have a unique point of failure which is AWS. The goal is to have complete control of your data and the restore process without depending on your main provider.
 
 Altough this script was created specific for Crunchy Bridge it can bem adapted to work with any provider that work with pgBackRest.
+
 ## CBOB Sync
 
 This is the main script that sync from Crunchy Bridge AWS S3 to local path.
@@ -13,15 +14,15 @@ This is the main script that sync from Crunchy Bridge AWS S3 to local path.
 
 This script is intended to be installed on a host that has pgBackRest installed. For a reference and how to setup this server, please refer to https://www.cybertec-postgresql.com/en/remote-backup-and-restore-with-pgbackrest/
 
-1. Clone this project:
+1.  Clone this project:
 
         $ git clone https://github.com/UniversoKobana/crunchybridge-offsite-backup.git
 
-2. Go to the created directory:
+2.  Go to the created directory:
 
         $ cd crunchybridge-offsite-backup
 
-3. Run the installation script:
+3.  Run the installation script:
 
         $ sudo ./install.sh
 
@@ -30,11 +31,13 @@ For security reason, read the [installation script source before](https://github
 After installation finishes you an remove the source
 
     $ cd .. && rm -Rf crunchybridge-offsite-backup
+
 ### Running
 
 The script will automatically run once a day, but if you need to invoke manually, run:
 
     $ sudo cbob_sync
+
 ### Configuration
 
 #### Via Config File
@@ -67,11 +70,12 @@ You can set the environment variables using export, ex:
 
 Or passing the variables in the command line, ex:
 
-    $ CBOB_CRUNCHY_API_KEY=xxx /usr/local/bin/crunchybridge_offsite_backup 
+    $ CBOB_CRUNCHY_API_KEY=xxx /usr/local/bin/crunchybridge_offsite_backup
 
 ### Configuration Options
 
 You can set the following options:
+
 #### API Key
 
 `CBOB_CRUNCHY_API_KEY`
@@ -136,6 +140,7 @@ app with a [Slack API token](https://api.slack.com/web).
 `CBOB_SLACK_CHANNEL` with the channel name ehre the messages will be posted, ex: `#backup-log`
 
 It uses the [slack-cli](https://github.com/rockymadden/slack-cli) that is bundled with this installation.
+
 #### Heartbeat
 
 You can add a `CBOB_SYNC_HEARTBEAT_URL` to the script so a request gets sent every time a backup is made.
@@ -158,48 +163,50 @@ The source is tested on a Debian 11 running on Digital Ocean.
 
 The setup is written for Digital Ocean but you can use it on any linux server.
 
-1. [Create a new droplet](https://cloud.digitalocean.com/droplets/new) to host the solution
-   1. Choose the image `Debian 11 x64`
-   2. Choose the size, we recommend Basic > Premium Intel with at least 2 vCPUs and 2GB RAM. Don't worry about disk space (SSD) we will setup a volume to host the backup.
-   3. Choose Authentication Method, we recommend `SSH Key` for security.
-   4. Choose the hostname, we use `crunchybridge-offsite-backup`
+1.  [Create a new droplet](https://cloud.digitalocean.com/droplets/new) to host the solution
 
-2. Wait for the Droplet to finish setup and take note of the IP of the new virtual machine. Let's say it is `999.888.777.666` for our examples.
+    1. Choose the image `Debian 11 x64`
+    2. Choose the size, we recommend Basic > Premium Intel with at least 2 vCPUs and 2GB RAM. Don't worry about disk space (SSD) we will setup a volume to host the backup.
+    3. Choose Authentication Method, we recommend `SSH Key` for security.
+    4. Choose the hostname, we use `crunchybridge-offsite-backup`
 
-3. [Create a new volume](https://cloud.digitalocean.com/volumes/new) to be used as the storage for all backups
-   1. Choose the size, we recommend at least 20 times the current size of all clusters. This is because we will sync the entire pgBackRest repository that contains all backups Crunchy Bridge has for each cluster.
-   2. Select the droptlet to attach choosing the one created on the step below (`crunchybridge-offsite-backup`)
-   3. Name the volume, we recommend naming `volume-cbob` and it will be mounted at `/mnt/volume_cbob`
-   4. Choose Automatically Format & Mount
-   5. Choose the `XFS Filesystem`
+2.  Wait for the Droplet to finish setup and take note of the IP of the new virtual machine. Let's say it is `999.888.777.666` for our examples.
 
-4. Wait for the volume to be created and mounted.
+3.  [Create a new volume](https://cloud.digitalocean.com/volumes/new) to be used as the storage for all backups
 
-5. Login into the server, example:
+    1. Choose the size, we recommend at least 20 times the current size of all clusters. This is because we will sync the entire pgBackRest repository that contains all backups Crunchy Bridge has for each cluster.
+    2. Select the droptlet to attach choosing the one created on the step below (`crunchybridge-offsite-backup`)
+    3. Name the volume, we recommend naming `volume-cbob` and it will be mounted at `/mnt/volume_cbob`
+    4. Choose Automatically Format & Mount
+    5. Choose the `XFS Filesystem`
+
+4.  Wait for the volume to be created and mounted.
+
+5.  Login into the server, example:
 
         $ ssh root@999.888.777.666
 
-1. Install git
+6.  Install git
 
         $ apt update && apt install -y git
 
-2. Clone the project
+7.  Clone the project
 
         $ git clone https://github.com/UniversoKobana/crunchybridge-offsite-backup.git
 
-3.  Go to the created directory:
+8.  Go to the created directory:
 
         $ cd crunchybridge-offsite-backup
 
-4.   Run the setup script:
+9.  Run the setup script:
 
-  ⚠️ Do not run setup script on your local machine or on a PostgreSQL host ⚠️
+⚠️ Do not run setup script on your local machine or on a PostgreSQL host ⚠️
 
     $ ./setup.sh
 
-  Note that the setup script is different from installation script.
+Note that the setup script is different from installation script.
 
-  🔑 Take note of admin password!
+🔑 Take note of admin password!
 
 1.  Ready! You now can connect to the virtual machine as admin user, example:
 
@@ -216,7 +223,6 @@ If you need to reconfigure to change the api key, change the slack token or add 
 To sync Crunchy Bridge pgBackRest full respository from AWS S3 to local path
 
     $ cbob_sync
-
 
 #### Sync and Expire
 
@@ -246,42 +252,42 @@ It is configured on `/etc/pgbackrest/pgbackrest.conf`
 ### Restoring to local database
 
 You can also restore all backups to local databases to do whaterver you need.
-It is configured out of the box and the PostgreSQL data directory is configured at `/mnt/volume_cbob/postgresql/15/[cluster]` where `[cluster]` is the id of each cluster named by Crunchy Bridge.
+It is configured out of the box and the PostgreSQL data directory is configured at `/mnt/volume_cbob/postgresql/17/[cluster]` where `[cluster]` is the id of each cluster named by Crunchy Bridge.
 
 We provide the following scripts to help starting and stopping all clusters at same time.
 
-*cbob_postgres_initdb* - create postgresql data directory for each cluster. It is already called on setup and you don't need to call it again, unless you are hacking something.
+_cbob_postgres_initdb_ - create postgresql data directory for each cluster. It is already called on setup and you don't need to call it again, unless you are hacking something.
 
-*cbob_postgres_start* - starts all clusters, one for each stanza in a different port
+_cbob_postgres_start_ - starts all clusters, one for each stanza in a different port
 
-*cbob_postgres_stop* - stop all clusters
+_cbob_postgres_stop_ - stop all clusters
 
-*cbob_postgres_restart* - restart all clusters
+_cbob_postgres_restart_ - restart all clusters
 
 To restore the backup of one cluster, run the following steps:
 
-1. Stop all clusters
+1.  Stop all clusters
 
         $ cbob_postgres_stop
 
-2. Get the repository info just to confirm that pgBackRest is running correctly
+2.  Get the repository info just to confirm that pgBackRest is running correctly
 
         $ sudo -u postgres pgbackrest --stanza=xxxxx info
 
-  (where `xxxxx` is the stanza id)
+(where `xxxxx` is the stanza id)
 
-3. Restore the backup for one specific stanza
+3.  Restore the backup for one specific stanza
 
         $ sudo -u postgres pgbackrest --stanza=xxxxx restore --force
 
-  (where `xxxxx` is the stanza id)
+(where `xxxxx` is the stanza id)
 
-4. Start all clusters
+4.  Start all clusters
 
         $ cbob_postgres_start
 
-5. Ready!
-   
+5.  Ready!
+
 It is possible that the server won't start for an incompatibility from postgresql instalation and the conf that was restored. If this problem occurs refer to the log.
 
 Tip, run the following command to set the CLUSTER variable and make it easy to work with directories.
@@ -290,28 +296,27 @@ Tip, run the following command to set the CLUSTER variable and make it easy to w
 
 Now run:
 
-    $ sudo tail /mnt/volume_cbob/log/postgresql/postgresql-15-$CLUSTER.log
+    $ sudo tail /mnt/volume_cbob/log/postgresql/postgresql-17-$CLUSTER.log
 
 If needed edit the postgresql configuration for this stanza by running:
 
-    $ sudo nano -w /mnt/volume_cbob/postgresql/15/$CLUSTER/postgresql.conf
+    $ sudo nano -w /mnt/volume_cbob/postgresql/17/$CLUSTER/postgresql.conf
 
 ## Common Problems
 
-1. **FATAL:  could not access file "pgpodman": No such file or directory**
+1.  **FATAL: could not access file "pgpodman": No such file or directory**
 
     Edit `postgresql.conf` and remove `pgpodman` from `shared_library` list.
 
-1. **FATAL:  private key file "server.key" has group or world access**
+1.  **FATAL: private key file "server.key" has group or world access**
 
-        $ sudo chmod 0600 /mnt/volume_cbob/postgresql/15/$CLUSTER/server.key
+        $ sudo chmod 0600 /mnt/volume_cbob/postgresql/17/$CLUSTER/server.key
 
-2. **FATAL:  could not map anonymous shared memory: Cannot allocate memory**
+1.  **FATAL: could not map anonymous shared memory: Cannot allocate memory**
 
     Edit `postgresql.conf` and change the value of `max_connections` to 10.
 
 Remember, you need to do it for each cluster you configured.
-
 
 ### Cron
 
@@ -325,6 +330,7 @@ If configured correctly, the output of both scripts will be sent do Slack.
 If you want to receive the restore_check report by email, create the following file with content below:
 
 `/etc/profile.d/pgbackrest_config.sh`
+
 ```
 export PGBACKREST_AUTO_SMTP_SERVER="localhost:25"
 export PGBACKREST_AUTO_MAIL_FROM="me@example.com"
@@ -332,30 +338,31 @@ export PGBACKREST_AUTO_MAIL_TO="logs@example.com"
 export PGBACKREST_AUTO_ATTACH_REPORT="true"
 ```
 
-### Logs 
+### Logs
 
 All logs are saved at `/mnt/volume_cbob/log`.
 
-- *PostgreSQL* - `/mnt/volume_cbob/log/postgresql`
-- *pgBackRest* - `/mnt/volume_cbob/log/pgbackrest`
-- *Off-site Backup Scripts* - `/mnt/volume_cbob/log/cbob`
+- _PostgreSQL_ - `/mnt/volume_cbob/log/postgresql`
+- _pgBackRest_ - `/mnt/volume_cbob/log/pgbackrest`
+- _Off-site Backup Scripts_ - `/mnt/volume_cbob/log/cbob`
 
 ## To be done
 
 - [ ] Implement parameters on cbob_sync to make it more versatile
-- [ ] Move content from cbob_* scripts to configuration files
-- [ ] Create one script called `cbob` with all parameters, and delete cbob_*
+- [ ] Move content from cbob\_\* scripts to configuration files
+- [ ] Create one script called `cbob` with all parameters, and delete cbob\_\*
 
 PRs are welcome!
 
 ## Author
 
 [Rafael Lima](https://github.com/rafaelp) working for [Kobana](https://github.com/UniversoKobana)
+
 ## License
 
 The MIT License (MIT)
 
-Copyright (c) 2023 KOBANA INSTITUICAO DE PAGAMENTO LTDA 
+Copyright (c) 2023 KOBANA INSTITUICAO DE PAGAMENTO LTDA
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

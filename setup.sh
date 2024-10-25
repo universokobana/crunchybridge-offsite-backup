@@ -44,9 +44,9 @@ if [ -f $CONFIG_FILE ]; then
   fi
 fi
 
-read -re -p 'Which version of PostgreSQL do you use: ' -i "${CBOB_PG_VERSION:-16}" CBOB_PG_VERSION
-if [ "$CBOB_PG_VERSION" != "15" ] && [ "$CBOB_PG_VERSION" != "16" ]; then
-  error "Invalid version, choose 15 or 16"
+read -re -p 'Which version of PostgreSQL do you use: ' -i "${CBOB_PG_VERSION:-17}" CBOB_PG_VERSION
+if [ "$CBOB_PG_VERSION" != "17" ]; then
+  error "Invalid version, choose 17"
 fi
 
 read -re -p 'Please inform your Crunch Bridge API Key: ' -i "$CBOB_CRUNCHY_API_KEY" CBOB_CRUNCHY_API_KEY
@@ -102,10 +102,8 @@ if [ ! -f /etc/apt/sources.list.d/pgdg.list ]; then
 fi
 
 info "Installing main packages"
-if [ $CBOB_PG_VERSION = '15' ]; then
-  apt install -y postgresql-15 postgresql-client-15 postgresql-15-pgaudit pgbackrest
-elif [ $CBOB_PG_VERSION = '16' ]; then
-  apt install -y postgresql-16 postgresql-client-16 postgresql-16-pgaudit pgbackrest
+if [ $CBOB_PG_VERSION = '17' ]; then
+  apt install -y postgresql-17 postgresql-client-17 postgresql-17-pgaudit pgbackrest
 else
   error "Invalid PostgreSQL version"
 fi
