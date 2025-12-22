@@ -100,7 +100,8 @@ debug() {
 
 info() {
     log_message "INFO" "$1"
-    notify "$1"
+    # Note: info messages are logged but NOT sent to Slack
+    # Use notify() directly for important messages that should go to Slack
 }
 
 warning() {

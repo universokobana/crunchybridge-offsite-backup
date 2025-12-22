@@ -354,7 +354,7 @@ main() {
     
     info "Crunchy Bridge Off-site Backup Sync v${CBOB_VERSION}"
     info "Starting at $(date)"
-    
+
     # Determine which clusters to sync
     local clusters_to_sync=()
     if [ ${#SYNC_CLUSTERS[@]} -gt 0 ]; then
@@ -364,8 +364,9 @@ main() {
         # Use all configured clusters
         IFS=',' read -ra clusters_to_sync <<< "$CBOB_CRUNCHY_CLUSTERS"
     fi
-    
+
     info "Clusters to sync: ${clusters_to_sync[*]}"
+    notify ":arrows_counterclockwise: CBOB Sync starting (${#clusters_to_sync[@]} clusters)"
     
     # Sync clusters
     local failed_clusters=()
@@ -417,6 +418,7 @@ main() {
     fi
     
     info "✓ All backups synced successfully!"
+    notify ":white_check_mark: CBOB Sync completed! ${#clusters_to_sync[@]} clusters synced successfully."
 }
 
 # Run main function

@@ -65,7 +65,7 @@ get_all_stanzas() {
 # If using S3 destination, downloads the backup to a local directory
 prepare_local_repo() {
     local stanza="$1"
-    local local_repo_path="${CBOB_BASE_PATH:-/var/lib/cbob}/repo_cache"
+    local local_repo_path="${CBOB_REPO_CACHE:-${CBOB_BASE_PATH:-/var/lib/cbob}/repo_cache}"
 
     if is_dest_s3; then
         info "Downloading backup from S3 destination for stanza: $stanza"
@@ -88,7 +88,7 @@ prepare_local_repo() {
 # Check single stanza
 check_stanza() {
     local stanza="$1"
-    local restore_dir="${CBOB_BASE_PATH}/restores/${stanza}"
+    local restore_dir="${CBOB_RESTORES_PATH:-${CBOB_BASE_PATH:-/var/lib/cbob}/restores}/${stanza}"
     local skip_checkdb="${2:-false}"
     local report_dir="${3:-}"
 
@@ -288,7 +288,8 @@ main() {
     fi
     
     info "Stanzas to check: ${stanzas[*]}"
-    
+    notify ":mag: CBOB Restore Check starting (${#stanzas[@]} stanzas)"
+
     # Set report directory
     if [ -z "$report_dir" ]; then
         report_dir="${CBOB_BASE_PATH}/restores/reports/$(date +%Y%m%d_%H%M%S)"
@@ -347,6 +348,7 @@ main() {
     fi
     
     info "✓ All restore checks passed!"
+    notify ":white_check_mark: CBOB Restore Check completed! ${#stanzas[@]} stanzas verified successfully."
 }
 
 # Run main function
