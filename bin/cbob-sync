@@ -393,7 +393,7 @@ main() {
         # Sequential sync
         for cluster_id in "${clusters_to_sync[@]}"; do
             if sync_cluster "$cluster_id"; then
-                ((success_count++))
+                ((++success_count))
             else
                 failed_clusters+=("$cluster_id")
             fi
