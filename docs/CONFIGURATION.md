@@ -72,6 +72,21 @@ CBOB_DRY_RUN=false
 CBOB_NONINTERACTIVE=false
 ```
 
+### Volume/Storage Paths
+
+When using a separate volume for temporary files and cache (recommended for large backups):
+
+```bash
+# Temporary directory for AWS CLI operations (useful for large volumes)
+CBOB_TMPDIR=/mnt/volume/cbob/tmp
+
+# Repository cache for restore-check (downloads from S3 for validation)
+CBOB_REPO_CACHE=/mnt/volume/cbob/repo_cache
+
+# Temporary restore directory for validation
+CBOB_RESTORES_PATH=/mnt/volume/cbob/restores
+```
+
 ### S3-Compatible Storage Destination
 
 Configure CBOB to sync backups to S3-compatible storage (DigitalOcean Spaces, Hetzner, MinIO, etc.):

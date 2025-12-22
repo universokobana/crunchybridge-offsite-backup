@@ -32,6 +32,7 @@ Usage: $CBOB_COMMAND <command> [options]
 Commands:
     sync                 Sync backups from Crunchy Bridge to local storage
     restore-check        Check integrity of all backups using pgbackrest_auto
+    cache-cleanup        Clean repository cache after successful restore-check
     info                 Show information about all stanzas
     expire               Expire old backups based on retention policy
     postgres             Manage local PostgreSQL instances
@@ -128,6 +129,9 @@ main() {
             ;;
         restore-check|check)
             exec "${SCRIPT_DIR}/cbob-restore-check" "$@"
+            ;;
+        cache-cleanup)
+            exec "${SCRIPT_DIR}/cbob-cache-cleanup" "$@"
             ;;
         info)
             exec "${SCRIPT_DIR}/cbob-info" "$@"

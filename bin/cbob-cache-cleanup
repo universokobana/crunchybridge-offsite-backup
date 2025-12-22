@@ -1,0 +1,125 @@
+#!/bin/bash
+
+# CBOB Cache Cleanup - Cleans repo_cache if last restore-check was successful
+# This script is designed to run after restore-check to free up disk space
+
+set -euo pipefail
+
+# Source common functions
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -f "${SCRIPT_DIR}/../lib/cbob_common.sh" ]; then
+    source "${SCRIPT_DIR}/../lib/cbob_common.sh"
+else
+    source "/usr/local/lib/cbob/cbob_common.sh"
+fi
+
+# Help text
+show_help() {
+    cat << EOF
+Usage: cbob cache-cleanup [options]
+
+Cleans the repository cache directory if the last restore-check was successful.
+This helps free up disk space after backup validation.
+
+Options:
+    --force         Clean cache even if last restore-check failed
+    --dry-run       Show what would be cleaned without actually cleaning
+    --help, -h      Show this help message
+
+The cache directory is determined by:
+    1. CBOB_REPO_CACHE environment variable
+    2. \${CBOB_BASE_PATH}/repo_cache (default)
+
+Examples:
+    cbob cache-cleanup              # Clean if last restore-check passed
+    cbob cache-cleanup --force      # Clean regardless of restore-check status
+    cbob cache-cleanup --dry-run    # Show what would be cleaned
+
+EOF
+}
+
+# Main function
+main() {
+    local force=false
+    local dry_run=false
+
+    # Parse options
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --force)
+                force=true
+                shift
+                ;;
+            --dry-run)
+                dry_run=true
+                shift
+                ;;
+            --help|-h)
+                show_help
+                exit 0
+                ;;
+            *)
+                error "Unknown option: $1"
+                ;;
+        esac
+    done
+
+    # Load configuration
+    load_config
+
+    local log_file="${CBOB_LOG_PATH:-/var/log/cbob}/cron_restore.log"
+    local cache_dir="${CBOB_REPO_CACHE:-${CBOB_BASE_PATH:-/var/lib/cbob}/repo_cache}"
+
+    info "CBOB Cache Cleanup"
+    info "Cache directory: $cache_dir"
+
+    # Check if cache directory exists
+    if [ ! -d "$cache_dir" ]; then
+        info "Cache directory does not exist: $cache_dir"
+        exit 0
+    fi
+
+    # Check cache size
+    local cache_size
+    cache_size=$(du -sh "$cache_dir" 2>/dev/null | cut -f1 || echo "0")
+    info "Current cache size: $cache_size"
+
+    # Check if we should clean
+    local should_clean=false
+
+    if [ "$force" = true ]; then
+        info "Force mode enabled, will clean cache"
+        should_clean=true
+    elif [ ! -f "$log_file" ]; then
+        warning "Restore log not found: $log_file"
+        info "Use --force to clean anyway"
+        exit 1
+    elif tail -100 "$log_file" | grep -q "All restore checks passed"; then
+        info "Last restore-check was successful"
+        should_clean=true
+    else
+        warning "Last restore-check failed or not found - skipping cache cleanup"
+        info "Use --force to clean anyway"
+        exit 1
+    fi
+
+    # Clean cache
+    if [ "$should_clean" = true ]; then
+        if [ "$dry_run" = true ]; then
+            info "[DRY-RUN] Would clean cache directory: $cache_dir"
+            info "[DRY-RUN] Files that would be removed:"
+            find "$cache_dir" -type f 2>/dev/null | head -20
+            local file_count
+            file_count=$(find "$cache_dir" -type f 2>/dev/null | wc -l)
+            info "[DRY-RUN] Total files: $file_count"
+        else
+            info "Cleaning cache directory: $cache_dir"
+            rm -rf "${cache_dir:?}"/*
+            info "Cache cleanup completed"
+            notify ":broom: CBOB cache cleaned ($cache_size freed)"
+        fi
+    fi
+}
+
+# Run main function
+main "$@"
