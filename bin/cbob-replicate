@@ -1,0 +1,472 @@
+#!/bin/bash
+
+# CBOB Replicate - Multi-region replication management
+# Replicate backups across regions and cloud providers
+
+set -euo pipefail
+
+# Source common functions
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -f "${SCRIPT_DIR}/../lib/cbob_common.sh" ]; then
+    source "${SCRIPT_DIR}/../lib/cbob_common.sh"
+else
+    source "/usr/local/lib/cbob/cbob_common.sh"
+fi
+if [ -f "${SCRIPT_DIR}/../lib/cbob_replication.sh" ]; then
+    source "${SCRIPT_DIR}/../lib/cbob_replication.sh"
+else
+    source "/usr/local/lib/cbob/cbob_replication.sh"
+fi
+
+# Help text
+show_help() {
+    cat << EOF
+Usage: cbob replicate <subcommand> [options]
+
+Multi-region replication management for CBOB backups.
+
+Subcommands:
+    sync        Sync backups to configured replicas
+    status      Show replication status
+    health      Check replication health
+    verify      Verify replica integrity
+    config      Show replication configuration
+    init        Initialize replication configuration
+    test        Test replication connectivity
+    help        Show this help message
+
+Options:
+    --replica NAME      Operate on specific replica only
+    --parallel N        Number of parallel operations (default: 1)
+    --verify            Verify after sync
+    --force             Force operation without confirmation
+    --dry-run           Show what would be replicated
+    --help, -h          Show help for specific subcommand
+
+Examples:
+    cbob replicate sync                     # Sync to all replicas
+    cbob replicate sync --replica eu-west   # Sync to specific replica
+    cbob replicate status                   # Show all replica status
+    cbob replicate health                   # Check replica health
+    cbob replicate verify --replica asia    # Verify specific replica
+
+Configuration:
+    Replication is configured via ${CBOB_BASE_PATH}/config/replication.yaml
+
+EOF
+}
+
+# Show replication status
+show_replication_status() {
+    local replica_filter="${1:-}"
+    
+    info "Replication Status"
+    echo "=================="
+    
+    # Load configuration and state
+    local config=$(get_replication_config)
+    
+    if [ ! -f "$REPLICATION_STATE" ]; then
+        warning "No replication state found. Run 'cbob replicate sync' first."
+        return 1
+    fi
+    
+    local state=$(cat "$REPLICATION_STATE")
+    
+    # Show primary configuration
+    echo
+    echo "Primary Storage:"
+    local primary=$(echo "$config" | jq -r '.primary')
+    echo "  Provider: $(echo "$primary" | jq -r '.provider')"
+    echo "  Region: $(echo "$primary" | jq -r '.region')"
+    echo "  Bucket: $(echo "$primary" | jq -r '.bucket')"
+    
+    # Show replicas
+    echo
+    echo "Replicas:"
+    printf "%-20s %-10s %-15s %-20s %-20s %s\n" \
+        "NAME" "PROVIDER" "REGION" "DESTINATION" "STATUS" "LAST SYNC"
+    printf "%-20s %-10s %-15s %-20s %-20s %s\n" \
+        "----" "--------" "------" "-----------" "------" "---------"
+    
+    local replicas=$(echo "$config" | jq -r '.replicas[]' 2>/dev/null)
+    
+    while IFS= read -r replica_json; do
+        local name=$(echo "$replica_json" | jq -r '.name')
+        
+        # Apply filter if specified
+        if [ -n "$replica_filter" ] && [ "$name" != "$replica_filter" ]; then
+            continue
+        fi
+        
+        local provider=$(echo "$replica_json" | jq -r '.provider')
+        local region=$(echo "$replica_json" | jq -r '.region')
+        local bucket=$(echo "$replica_json" | jq -r '.bucket // .container // .space // "N/A"')
+        
+        # Get state info
+        local replica_state=$(echo "$state" | jq -r ".replicas[\"$name\"] // {}")
+        local status=$(echo "$replica_state" | jq -r '.status // "never synced"')
+        local last_sync=$(echo "$replica_state" | jq -r '.last_sync // "never"')
+        
+        # Format last sync time
+        if [ "$last_sync" != "never" ]; then
+            # Calculate age
+            local last_sync_epoch=$(date -d "$last_sync" +%s 2>/dev/null || echo 0)
+            local now=$(date +%s)
+            local age=$((now - last_sync_epoch))
+            
+            if [ $age -lt 3600 ]; then
+                last_sync="$((age / 60))m ago"
+            elif [ $age -lt 86400 ]; then
+                last_sync="$((age / 3600))h ago"
+            else
+                last_sync="$((age / 86400))d ago"
+            fi
+        fi
+        
+        # Color code status
+        local status_color=""
+        case "$status" in
+            success) status_color="\033[32m" ;;  # Green
+            failed) status_color="\033[31m" ;;   # Red
+            *) status_color="\033[33m" ;;        # Yellow
+        esac
+        
+        printf "%-20s %-10s %-15s %-20s ${status_color}%-20s\033[0m %s\n" \
+            "$name" "$provider" "$region" "$bucket" "$status" "$last_sync"
+    done <<< "$(echo "$config" | jq -c '.replicas[]' 2>/dev/null)"
+}
+
+# Test replication connectivity
+test_replication() {
+    local replica_filter="${1:-}"
+    
+    info "Testing replication connectivity"
+    echo "==============================="
+    
+    local config=$(get_replication_config)
+    local replicas=$(echo "$config" | jq -r '.replicas[]' 2>/dev/null)
+    
+    local passed=0
+    local failed=0
+    
+    while IFS= read -r replica_json; do
+        local name=$(echo "$replica_json" | jq -r '.name')
+        
+        # Apply filter if specified
+        if [ -n "$replica_filter" ] && [ "$name" != "$replica_filter" ]; then
+            continue
+        fi
+        
+        local provider=$(echo "$replica_json" | jq -r '.provider')
+        local region=$(echo "$replica_json" | jq -r '.region')
+        local bucket=$(echo "$replica_json" | jq -r '.bucket // .container // .space // ""')
+        
+        echo
+        echo "Testing $name ($provider)..."
+        
+        # Test based on provider
+        case "$provider" in
+            aws|s3)
+                if aws s3 ls "s3://$bucket" --region "$region" >/dev/null 2>&1; then
+                    echo "✓ AWS S3 connection successful"
+                    ((passed++))
+                else
+                    echo "✗ AWS S3 connection failed"
+                    ((failed++))
+                fi
+                ;;
+            azure)
+                local account=$(echo "$replica_json" | jq -r '.storage_account')
+                if az storage container exists --name "$bucket" --account-name "$account" >/dev/null 2>&1; then
+                    echo "✓ Azure Blob connection successful"
+                    ((passed++))
+                else
+                    echo "✗ Azure Blob connection failed"
+                    ((failed++))
+                fi
+                ;;
+            gcp)
+                if gsutil ls "gs://$bucket" >/dev/null 2>&1; then
+                    echo "✓ GCS connection successful"
+                    ((passed++))
+                else
+                    echo "✗ GCS connection failed"
+                    ((failed++))
+                fi
+                ;;
+            do|digitalocean)
+                local endpoint="https://${region}.digitaloceanspaces.com"
+                if aws s3 ls "s3://$bucket" --endpoint-url "$endpoint" >/dev/null 2>&1; then
+                    echo "✓ DigitalOcean Spaces connection successful"
+                    ((passed++))
+                else
+                    echo "✗ DigitalOcean Spaces connection failed"
+                    ((failed++))
+                fi
+                ;;
+            *)
+                echo "✗ Unknown provider: $provider"
+                ((failed++))
+                ;;
+        esac
+    done <<< "$(echo "$config" | jq -c '.replicas[]' 2>/dev/null)"
+    
+    echo
+    echo "Summary:"
+    echo "  Passed: $passed"
+    echo "  Failed: $failed"
+    
+    return $failed
+}
+
+# Initialize replication configuration
+init_replication_config() {
+    local config_file="${CBOB_REPLICATION_CONFIG:-${CBOB_BASE_PATH}/config/replication.yaml}"
+    
+    info "Initializing replication configuration"
+    
+    # Check if config already exists
+    if [ -f "$config_file" ]; then
+        read -p "Configuration already exists. Overwrite? (y/N) " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            info "Configuration initialization cancelled"
+            return 0
+        fi
+    fi
+    
+    # Create example configuration
+    mkdir -p "$(dirname "$config_file")"
+    cat > "$config_file" << 'EOF'
+# CBOB Multi-Region Replication Configuration
+# 
+# This file defines how backups are replicated across regions and cloud providers
+# 
+# Supported providers: aws, azure, gcp, digitalocean, minio
+
+replication:
+  # Primary backup location (source for replication)
+  primary:
+    provider: aws
+    region: us-east-1
+    bucket: ${CBOB_PRIMARY_BUCKET}
+    
+  # Replica destinations
+  replicas:
+    # AWS Europe replica
+    - name: aws-eu
+      provider: aws
+      region: eu-west-1
+      bucket: ${CBOB_EU_BUCKET}
+      prefix: backups/
+      sync_interval: 1h
+      retention_days: 30
+      
+    # Azure replica for compliance
+    - name: azure-west
+      provider: azure
+      region: westus2
+      storage_account: ${AZURE_STORAGE_ACCOUNT}
+      container: cbob-backups
+      prefix: replicas/
+      sync_interval: 6h
+      retention_days: 90
+      
+    # GCP replica for disaster recovery
+    - name: gcp-asia
+      provider: gcp
+      project: ${GCP_PROJECT_ID}
+      region: asia-southeast1
+      bucket: ${GCP_BUCKET}
+      sync_interval: 12h
+      retention_days: 60
+      
+    # DigitalOcean Spaces replica
+    - name: do-nyc
+      provider: digitalocean
+      region: nyc3
+      space: ${DO_SPACE_NAME}
+      access_key: ${DO_ACCESS_KEY}
+      secret_key: ${DO_SECRET_KEY}
+      sync_interval: 24h
+      retention_days: 30
+
+  # Global settings
+  settings:
+    # Maximum bandwidth for replication (e.g., "10MB/s")
+    bandwidth_limit: ""
+    
+    # Number of parallel transfers
+    parallel_transfers: 4
+    
+    # Verify checksums after sync
+    verify_after_sync: true
+    
+    # Alert on replication failure
+    alert_on_failure: true
+    
+    # Retry failed replications
+    retry_attempts: 3
+    retry_delay: 300  # seconds
+EOF
+    
+    info "Replication configuration created at: $config_file"
+    echo
+    echo "Next steps:"
+    echo "1. Edit the configuration file to add your storage destinations"
+    echo "2. Set required environment variables or replace placeholders"
+    echo "3. Test connectivity: cbob replicate test"
+    echo "4. Start replication: cbob replicate sync"
+}
+
+# Verify replica integrity
+verify_replica() {
+    local replica_name="$1"
+    local source_path="${CBOB_TARGET_PATH}"
+    
+    info "Verifying replica: $replica_name"
+    
+    local config=$(get_replication_config)
+    local replica=$(echo "$config" | jq -r ".replicas[] | select(.name == \"$replica_name\")")
+    
+    if [ -z "$replica" ] || [ "$replica" = "null" ]; then
+        error "Replica not found: $replica_name"
+    fi
+    
+    local provider=$(echo "$replica" | jq -r '.provider')
+    local bucket=$(echo "$replica" | jq -r '.bucket // .container // .space // ""')
+    local prefix=$(echo "$replica" | jq -r '.prefix // ""')
+    
+    case "$provider" in
+        aws|s3)
+            local region=$(echo "$replica" | jq -r '.region')
+            aws_s3_configure "$region" "$bucket"
+            aws_s3_verify "$source_path" "$bucket" "$prefix"
+            ;;
+        *)
+            warning "Verification not implemented for provider: $provider"
+            return 1
+            ;;
+    esac
+}
+
+# Main function
+main() {
+    local subcommand="${1:-help}"
+    shift || true
+    
+    local target_replica=""
+    local parallel=1
+    local verify_after=false
+    local force=false
+    local dry_run=false
+    
+    # Parse options
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --replica)
+                target_replica="$2"
+                shift 2
+                ;;
+            --parallel)
+                parallel="$2"
+                shift 2
+                ;;
+            --verify)
+                verify_after=true
+                shift
+                ;;
+            --force)
+                force=true
+                shift
+                ;;
+            --dry-run)
+                dry_run=true
+                export CBOB_DRY_RUN=true
+                shift
+                ;;
+            --help|-h)
+                show_help
+                exit 0
+                ;;
+            *)
+                error "Unknown option: $1"
+                ;;
+        esac
+    done
+    
+    case "$subcommand" in
+        sync)
+            # Initialize replication
+            init_replication || {
+                error "Failed to initialize replication. Run 'cbob replicate init' first."
+            }
+            
+            if [ -n "$target_replica" ]; then
+                # Sync specific replica
+                info "Syncing to replica: $target_replica"
+                replicate_to_destination "$target_replica" "${CBOB_TARGET_PATH}"
+            else
+                # Sync all replicas
+                replicate_all "${CBOB_TARGET_PATH}" "$parallel"
+            fi
+            
+            # Verify if requested
+            if [ "$verify_after" = true ]; then
+                if [ -n "$target_replica" ]; then
+                    verify_replica "$target_replica"
+                else
+                    warning "Verify all replicas not implemented yet"
+                fi
+            fi
+            ;;
+            
+        status)
+            show_replication_status "$target_replica"
+            ;;
+            
+        health)
+            if check_replication_health "$target_replica"; then
+                info "✓ Replication is healthy"
+            else
+                error "✗ Replication health check failed"
+            fi
+            ;;
+            
+        verify)
+            if [ -z "$target_replica" ]; then
+                error "Please specify a replica with --replica NAME"
+            fi
+            verify_replica "$target_replica"
+            ;;
+            
+        config)
+            local config_file="${CBOB_REPLICATION_CONFIG:-${CBOB_BASE_PATH}/config/replication.yaml}"
+            if [ -f "$config_file" ]; then
+                cat "$config_file"
+            else
+                error "No replication configuration found. Run 'cbob replicate init' first."
+            fi
+            ;;
+            
+        init)
+            init_replication_config
+            ;;
+            
+        test)
+            test_replication "$target_replica"
+            ;;
+            
+        help|--help|-h)
+            show_help
+            ;;
+            
+        *)
+            error "Unknown subcommand: $subcommand"
+            ;;
+    esac
+}
+
+# Run main function
+main "$@"

@@ -1,0 +1,178 @@
+#!/bin/bash
+
+# CBOB Expire - Expire old backups based on retention policy
+# Uses pgBackRest expire functionality
+
+set -euo pipefail
+
+# Source common functions
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -f "${SCRIPT_DIR}/../lib/cbob_common.sh" ]; then
+    source "${SCRIPT_DIR}/../lib/cbob_common.sh"
+else
+    source "/usr/local/lib/cbob/cbob_common.sh"
+fi
+
+# Help text
+show_help() {
+    cat << EOF
+Usage: cbob expire [options]
+
+Expire old backups based on retention policy.
+
+Options:
+    --stanza NAME       Expire specific stanza only
+    --retention-full N  Override retention policy (number of full backups)
+    --force             Skip confirmation prompt
+    --help, -h          Show this help message
+
+Examples:
+    cbob expire                         # Expire all stanzas
+    cbob expire --stanza abc123         # Expire specific stanza
+    cbob expire --retention-full 3      # Keep only 3 full backups
+    cbob expire --force                 # Skip confirmation
+
+EOF
+}
+
+# Get all stanzas
+get_all_stanzas() {
+    load_config
+    validate_config "CBOB_CRUNCHY_CLUSTERS" "CBOB_CRUNCHY_API_KEY"
+    
+    local stanzas=()
+    IFS=',' read -ra clusters <<< "$CBOB_CRUNCHY_CLUSTERS"
+    
+    for cluster_id in "${clusters[@]}"; do
+        # Get stanza name from API
+        local credentials=$(curl -s -X POST \
+            "https://api.crunchybridge.com/clusters/$cluster_id/backup-tokens" \
+            -H "Authorization: Bearer $CBOB_CRUNCHY_API_KEY" 2>/dev/null || echo "{}")
+        
+        local stanza=$(echo "$credentials" | jq -r '.stanza // empty')
+        if [ -n "$stanza" ]; then
+            stanzas+=("$stanza")
+        fi
+    done
+    
+    echo "${stanzas[@]}"
+}
+
+# Expire stanza
+expire_stanza() {
+    local stanza="$1"
+    local retention="${2:-}"
+    
+    info "Expiring old backups for stanza: $stanza"
+    
+    local cmd="pgbackrest --stanza=$stanza --log-level-console=info expire"
+    
+    # Add retention override if specified
+    if [ -n "$retention" ]; then
+        cmd="$cmd --repo1-retention-full=$retention"
+    fi
+    
+    if $cmd; then
+        info "✓ Successfully expired backups for stanza: $stanza"
+        return 0
+    else
+        error "Failed to expire backups for stanza: $stanza"
+    fi
+}
+
+# Main function
+main() {
+    local target_stanza=""
+    local retention=""
+    local force=false
+    
+    # Parse options
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --stanza)
+                target_stanza="$2"
+                shift 2
+                ;;
+            --retention-full)
+                retention="$2"
+                if ! [[ "$retention" =~ ^[0-9]+$ ]]; then
+                    error "Invalid retention value: $retention (must be a number)"
+                fi
+                shift 2
+                ;;
+            --force)
+                force=true
+                shift
+                ;;
+            --help|-h)
+                show_help
+                exit 0
+                ;;
+            *)
+                error "Unknown option: $1"
+                ;;
+        esac
+    done
+    
+    # Check dependencies
+    check_dependencies "pgbackrest"
+    
+    # Load configuration
+    load_config
+    
+    # Get stanzas to expire
+    local stanzas=()
+    if [ -n "$target_stanza" ]; then
+        stanzas=("$target_stanza")
+    else
+        stanzas=($(get_all_stanzas))
+    fi
+    
+    if [ ${#stanzas[@]} -eq 0 ]; then
+        error "No stanzas found"
+    fi
+    
+    # Show what will be expired
+    info "Backup Expiration"
+    echo "================="
+    echo
+    echo "Stanzas to expire: ${stanzas[*]}"
+    
+    if [ -n "$retention" ]; then
+        echo "Retention override: $retention full backups"
+    else
+        echo "Retention policy: ${CBOB_RETENTION_FULL:-1} full backups (from config)"
+    fi
+    echo
+    
+    # Confirm unless forced
+    if [ "$force" != true ]; then
+        read -p "Continue with expiration? (y/N) " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            info "Expiration cancelled"
+            exit 0
+        fi
+    fi
+    
+    # Expire each stanza
+    local failed=0
+    for stanza in "${stanzas[@]}"; do
+        if ! expire_stanza "$stanza" "$retention"; then
+            ((failed++))
+        fi
+    done
+    
+    # Summary
+    echo
+    info "Expiration complete:"
+    info "  Total stanzas: ${#stanzas[@]}"
+    info "  Failed: $failed"
+    
+    if [ $failed -gt 0 ]; then
+        exit 1
+    fi
+}
+
+# Run main function
+main "$@"

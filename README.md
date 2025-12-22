@@ -6,6 +6,41 @@ An off-site backup is a copy of a business production system data that is stored
 
 Altough this script was created specific for Crunchy Bridge it can bem adapted to work with any provider that work with pgBackRest.
 
+## What's New in v2
+
+- **Unified CLI**: Single `cbob` command with subcommands for all operations
+- **Docker Support**: Run CBOB in containers with docker-compose
+- **S3 Destination Support**: Sync backups directly to S3-compatible storage (DigitalOcean Spaces, Hetzner, MinIO, etc.)
+- **Metrics & Monitoring**: Performance tracking and heartbeat monitoring
+- **Enhanced Security**: Input validation and secure credential storage
+- **Parallel Operations**: Sync multiple clusters simultaneously
+- **Structured Logging**: JSON logging support for log aggregation
+- **Multi-Region Replication**: Cross-region and cross-cloud backup replication
+- **PostgreSQL 18 Support**: Full compatibility with PostgreSQL 18
+
+See [MIGRATION.md](MIGRATION.md) for upgrading from v1.
+
+## Quick Start with Docker
+
+```bash
+# Clone the repository
+git clone https://github.com/UniversoKobana/crunchybridge-offsite-backup.git
+cd crunchybridge-offsite-backup
+
+# Copy and configure environment
+cp .env.example .env
+# Edit .env with your Crunchy Bridge API key, cluster IDs, and destination settings
+
+# Start with Docker Compose
+docker-compose up -d
+
+# Check status
+docker-compose ps
+docker-compose logs cbob
+```
+
+See [docs/DOCKER.md](docs/DOCKER.md) for detailed Docker usage.
+
 ## CBOB Sync
 
 This is the main script that sync from Crunchy Bridge AWS S3 to local path.
@@ -34,7 +69,17 @@ After installation finishes you an remove the source
 
 ### Running
 
-The script will automatically run once a day, but if you need to invoke manually, run:
+With v2 CLI:
+
+    $ sudo -u postgres cbob sync
+    
+    # With options
+    $ sudo -u postgres cbob sync --parallel 4 --dry-run
+    
+    # Specific clusters
+    $ sudo -u postgres cbob sync --cluster cluster1 --cluster cluster2
+
+Legacy v1 command (if not migrated):
 
     $ sudo cbob_sync
 
@@ -252,7 +297,7 @@ It is configured on `/etc/pgbackrest/pgbackrest.conf`
 ### Restoring to local database
 
 You can also restore all backups to local databases to do whaterver you need.
-It is configured out of the box and the PostgreSQL data directory is configured at `/mnt/volume_cbob/postgresql/17/[cluster]` where `[cluster]` is the id of each cluster named by Crunchy Bridge.
+It is configured out of the box and the PostgreSQL data directory is configured at `/mnt/volume_cbob/postgresql/18/[cluster]` where `[cluster]` is the id of each cluster named by Crunchy Bridge.
 
 We provide the following scripts to help starting and stopping all clusters at same time.
 
@@ -296,11 +341,11 @@ Tip, run the following command to set the CLUSTER variable and make it easy to w
 
 Now run:
 
-    $ sudo tail /mnt/volume_cbob/log/postgresql/postgresql-17-$CLUSTER.log
+    $ sudo tail /mnt/volume_cbob/log/postgresql/postgresql-18-$CLUSTER.log
 
 If needed edit the postgresql configuration for this stanza by running:
 
-    $ sudo nano -w /mnt/volume_cbob/postgresql/17/$CLUSTER/postgresql.conf
+    $ sudo nano -w /mnt/volume_cbob/postgresql/18/$CLUSTER/postgresql.conf
 
 ## Common Problems
 
@@ -310,7 +355,7 @@ If needed edit the postgresql configuration for this stanza by running:
 
 1.  **FATAL: private key file "server.key" has group or world access**
 
-        $ sudo chmod 0600 /mnt/volume_cbob/postgresql/17/$CLUSTER/server.key
+        $ sudo chmod 0600 /mnt/volume_cbob/postgresql/18/$CLUSTER/server.key
 
 1.  **FATAL: could not map anonymous shared memory: Cannot allocate memory**
 
@@ -346,11 +391,65 @@ All logs are saved at `/mnt/volume_cbob/log`.
 - _pgBackRest_ - `/mnt/volume_cbob/log/pgbackrest`
 - _Off-site Backup Scripts_ - `/mnt/volume_cbob/log/cbob`
 
+## S3 Destination Support
+
+CBOB v2 can sync backups directly to S3-compatible storage:
+
+```bash
+# Configuration example for S3 destination
+CBOB_DEST_TYPE=s3
+CBOB_DEST_ENDPOINT=https://fra1.digitaloceanspaces.com
+CBOB_DEST_BUCKET=my-cbob-backups
+CBOB_DEST_ACCESS_KEY=your-access-key
+CBOB_DEST_SECRET_KEY=your-secret-key
+CBOB_DEST_REGION=fra1
+```
+
+Supported providers:
+- DigitalOcean Spaces
+- Hetzner Object Storage
+- MinIO
+- Any S3-compatible storage
+
+## Monitoring & Metrics
+
+CBOB v2 provides monitoring capabilities:
+
+- Backup sync duration and success rate
+- Storage usage per cluster
+- Heartbeat URL notifications
+- Slack notifications
+- Structured JSON logging
+
+Access status via:
+- CLI: `cbob info`
+- CLI: `cbob config show`
+- Logs: `/var/log/cbob/`
+
+## Testing
+
+Run the test suite:
+
+```bash
+# Unit tests
+bash tests/test_common.sh
+
+# Integration tests
+bash tests/test_integration.sh
+
+# Performance tests
+bash tests/test_performance.sh
+```
+
 ## To be done
 
-- [ ] Implement parameters on cbob_sync to make it more versatile
-- [ ] Move content from cbob\_\* scripts to configuration files
-- [ ] Create one script called `cbob` with all parameters, and delete cbob\_\*
+- [x] Implement parameters on cbob_sync to make it more versatile
+- [x] Move content from cbob\_\* scripts to configuration files
+- [x] Create one script called `cbob` with all parameters, and delete cbob\_\*
+- [x] Multi-region replication support
+- [x] S3 destination support
+- [ ] Kubernetes Helm charts
+- [ ] Web UI for backup management
 
 PRs are welcome!
 
