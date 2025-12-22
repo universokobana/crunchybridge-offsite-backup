@@ -145,7 +145,7 @@ EOF
     # Run check
     local start_time=$(date +%s)
 
-    if sudo -u postgres $cmd; then
+    if $cmd; then
         local end_time=$(date +%s)
         local duration=$((end_time - start_time))
         info "✓ Backup check passed for stanza: $stanza (duration: ${duration}s)"
