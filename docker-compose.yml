@@ -1,0 +1,63 @@
+version: '3.8'
+
+services:
+  cbob:
+    build: .
+    image: cbob:latest
+    container_name: cbob
+    hostname: cbob
+    environment:
+      # Required configuration
+      - CBOB_CRUNCHY_API_KEY=${CBOB_CRUNCHY_API_KEY}
+      - CBOB_CRUNCHY_CLUSTERS=${CBOB_CRUNCHY_CLUSTERS}
+
+      # Destination configuration
+      - CBOB_DEST_TYPE=${CBOB_DEST_TYPE:-local}
+      - CBOB_TARGET_PATH=${CBOB_TARGET_PATH:-/data/backups}
+      - CBOB_DEST_ENDPOINT=${CBOB_DEST_ENDPOINT}
+      - CBOB_DEST_BUCKET=${CBOB_DEST_BUCKET}
+      - CBOB_DEST_ACCESS_KEY=${CBOB_DEST_ACCESS_KEY}
+      - CBOB_DEST_SECRET_KEY=${CBOB_DEST_SECRET_KEY}
+      - CBOB_DEST_REGION=${CBOB_DEST_REGION:-us-east-1}
+      - CBOB_DEST_PREFIX=${CBOB_DEST_PREFIX}
+
+      # Optional configuration
+      - CBOB_RETENTION_FULL=${CBOB_RETENTION_FULL:-1}
+      - CBOB_DRY_RUN=${CBOB_DRY_RUN:-false}
+      - CBOB_SLACK_CLI_TOKEN=${CBOB_SLACK_CLI_TOKEN}
+      - CBOB_SLACK_CHANNEL=${CBOB_SLACK_CHANNEL:-#backup-log}
+      - CBOB_SYNC_HEARTBEAT_URL=${CBOB_SYNC_HEARTBEAT_URL}
+      - CBOB_RESTORE_HEARTBEAT_URL=${CBOB_RESTORE_HEARTBEAT_URL}
+
+      # Logging
+      - CBOB_LOG_LEVEL=${CBOB_LOG_LEVEL:-info}
+      - CBOB_LOG_FORMAT=${CBOB_LOG_FORMAT:-text}
+
+    volumes:
+      # Data persistence
+      - cbob-data:/data
+      - cbob-logs:/var/log/cbob
+      - cbob-config:/etc/cbob
+
+    restart: unless-stopped
+
+    # Run in cron mode by default
+    command: cron
+
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+volumes:
+  cbob-data:
+    driver: local
+  cbob-logs:
+    driver: local
+  cbob-config:
+    driver: local

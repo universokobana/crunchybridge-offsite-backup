@@ -1,0 +1,355 @@
+#!/bin/bash
+
+# CBOB Restore Check - Check integrity of all backups
+# Uses pgbackrest_auto to validate backup integrity
+# Supports both local and S3-compatible storage destinations
+
+set -euo pipefail
+
+# Source common functions
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -f "${SCRIPT_DIR}/../lib/cbob_common.sh" ]; then
+    source "${SCRIPT_DIR}/../lib/cbob_common.sh"
+else
+    source "/usr/local/lib/cbob/cbob_common.sh"
+fi
+
+# Help text
+show_help() {
+    cat << EOF
+Usage: cbob restore-check [options]
+
+Check integrity of all backups using pgbackrest_auto.
+
+Options:
+    --stanza NAME       Check specific stanza only
+    --parallel N        Number of parallel checks (default: 1)
+    --skip-checkdb      Skip database consistency check
+    --report-dir DIR    Directory for reports (default: auto)
+    --email             Send report via email (requires config)
+    --help, -h          Show this help message
+
+Examples:
+    cbob restore-check                      # Check all stanzas
+    cbob restore-check --stanza abc123      # Check specific stanza
+    cbob restore-check --parallel 2         # Run 2 checks in parallel
+    cbob restore-check --email              # Send results via email
+
+EOF
+}
+
+# Get all stanzas
+get_all_stanzas() {
+    load_config
+    validate_config "CBOB_CRUNCHY_CLUSTERS" "CBOB_CRUNCHY_API_KEY"
+    
+    local stanzas=()
+    IFS=',' read -ra clusters <<< "$CBOB_CRUNCHY_CLUSTERS"
+    
+    for cluster_id in "${clusters[@]}"; do
+        # Get stanza name from API
+        local credentials=$(curl -s -X POST \
+            "https://api.crunchybridge.com/clusters/$cluster_id/backup-tokens" \
+            -H "Authorization: Bearer $CBOB_CRUNCHY_API_KEY" 2>/dev/null || echo "{}")
+        
+        local stanza=$(echo "$credentials" | jq -r '.stanza // empty')
+        if [ -n "$stanza" ]; then
+            stanzas+=("$stanza")
+        fi
+    done
+    
+    echo "${stanzas[@]}"
+}
+
+# Prepare local repository for restore check
+# If using S3 destination, downloads the backup to a local directory
+prepare_local_repo() {
+    local stanza="$1"
+    local local_repo_path="${CBOB_REPO_CACHE:-${CBOB_BASE_PATH:-/var/lib/cbob}/repo_cache}"
+
+    if is_dest_s3; then
+        info "Downloading backup from S3 destination for stanza: $stanza"
+
+        # Create local cache directory
+        mkdir -p "${local_repo_path}/archive/${stanza}"
+        mkdir -p "${local_repo_path}/backup/${stanza}"
+
+        # Download archive and backup directories
+        download_from_dest "/archive/${stanza}" "${local_repo_path}/archive/${stanza}"
+        download_from_dest "/backup/${stanza}" "${local_repo_path}/backup/${stanza}"
+
+        echo "$local_repo_path"
+    else
+        # For local destination, use the target path directly
+        echo "${CBOB_TARGET_PATH}"
+    fi
+}
+
+# Check single stanza
+check_stanza() {
+    local stanza="$1"
+    local restore_dir="${CBOB_RESTORES_PATH:-${CBOB_BASE_PATH:-/var/lib/cbob}/restores}/${stanza}"
+    local skip_checkdb="${2:-false}"
+    local report_dir="${3:-}"
+
+    info "Checking backup integrity for stanza: $stanza"
+
+    # Prepare local repository (downloads from S3 if needed)
+    local repo_path
+    repo_path=$(prepare_local_repo "$stanza")
+
+    if [ -z "$repo_path" ]; then
+        error "Failed to prepare local repository for stanza: $stanza"
+        return 1
+    fi
+
+    info "Using repository path: $repo_path"
+
+    # Build pgbackrest_auto command
+    local cmd="pgbackrest_auto"
+    cmd="$cmd --from=$stanza"
+    cmd="$cmd --to=$restore_dir"
+    cmd="$cmd --clear"
+    cmd="$cmd --report"
+
+    if [ "$skip_checkdb" != true ]; then
+        cmd="$cmd --checkdb"
+    fi
+
+    if [ -n "$report_dir" ]; then
+        cmd="$cmd --report-path=$report_dir"
+    fi
+
+    # Check if pgbackrest config exists
+    if [ -f "/etc/pgbackrest/pgbackrest.conf" ]; then
+        cmd="$cmd --config=/etc/pgbackrest/pgbackrest.conf"
+    fi
+
+    # For S3 destination, we need to temporarily update pgbackrest config
+    # to point to our local cache
+    local temp_config=""
+    if is_dest_s3; then
+        temp_config=$(mktemp)
+        cat > "$temp_config" << EOF
+[global]
+repo1-path=${repo_path}
+log-path=${CBOB_LOG_PATH:-/var/log}/pgbackrest
+
+[$stanza]
+pg1-path=${restore_dir}
+EOF
+        cmd="$cmd --config=$temp_config"
+        info "Using temporary pgBackRest config for S3 destination"
+    fi
+
+    # Run check
+    local start_time=$(date +%s)
+
+    if $cmd; then
+        local end_time=$(date +%s)
+        local duration=$((end_time - start_time))
+        info "✓ Backup check passed for stanza: $stanza (duration: ${duration}s)"
+
+        # Cleanup temp config
+        [ -n "$temp_config" ] && rm -f "$temp_config"
+        return 0
+    else
+        # Cleanup temp config
+        [ -n "$temp_config" ] && rm -f "$temp_config"
+        error "✗ Backup check failed for stanza: $stanza"
+        return 1
+    fi
+}
+
+# Send email report
+send_email_report() {
+    local report_files=("$@")
+    
+    # Check if email is configured
+    if [ -z "${PGBACKREST_AUTO_MAIL_TO:-}" ]; then
+        debug "Email not configured, skipping"
+        return 0
+    fi
+    
+    info "Sending email report to: $PGBACKREST_AUTO_MAIL_TO"
+    
+    # Build email
+    local subject="CBOB Restore Check Report - $(date +%Y-%m-%d)"
+    local body="Crunchy Bridge Off-site Backup restore check completed.\n\n"
+    body+="Timestamp: $(date)\n"
+    body+="Host: $(hostname)\n\n"
+    body+="See attached reports for details."
+    
+    # Send email with attachments
+    local mail_cmd="sendemail"
+    mail_cmd+=" -f '${PGBACKREST_AUTO_MAIL_FROM:-noreply@localhost}'"
+    mail_cmd+=" -t '$PGBACKREST_AUTO_MAIL_TO'"
+    mail_cmd+=" -u '$subject'"
+    mail_cmd+=" -m '$body'"
+    
+    if [ -n "${PGBACKREST_AUTO_SMTP_SERVER:-}" ]; then
+        mail_cmd+=" -s '$PGBACKREST_AUTO_SMTP_SERVER'"
+    fi
+    
+    # Add attachments
+    for report in "${report_files[@]}"; do
+        if [ -f "$report" ]; then
+            mail_cmd+=" -a '$report'"
+        fi
+    done
+    
+    if eval $mail_cmd; then
+        info "✓ Email report sent successfully"
+    else
+        warning "Failed to send email report"
+    fi
+}
+
+# Main function
+main() {
+    local target_stanza=""
+    local parallel=1
+    local skip_checkdb=false
+    local report_dir=""
+    local send_email=false
+    
+    # Parse options
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --stanza)
+                target_stanza="$2"
+                shift 2
+                ;;
+            --parallel)
+                parallel="$2"
+                shift 2
+                ;;
+            --skip-checkdb)
+                skip_checkdb=true
+                shift
+                ;;
+            --report-dir)
+                report_dir="$2"
+                shift 2
+                ;;
+            --email)
+                send_email=true
+                shift
+                ;;
+            --help|-h)
+                show_help
+                exit 0
+                ;;
+            *)
+                error "Unknown option: $1"
+                ;;
+        esac
+    done
+    
+    # Check dependencies
+    check_dependencies "pgbackrest_auto" "pgbackrest"
+    
+    # Acquire lock
+    if [ "${CBOB_NO_LOCK:-false}" != "true" ]; then
+        acquire_lock "cbob_restore_check"
+    fi
+    
+    # Load configuration
+    load_config
+    validate_config "CBOB_BASE_PATH"
+
+    # Validate destination-specific configuration
+    if is_dest_s3; then
+        info "Using S3-compatible storage destination"
+        validate_dest_s3_config
+    else
+        info "Using local storage destination"
+        validate_config "CBOB_TARGET_PATH"
+    fi
+    
+    # Set up logging
+    local log_file="${CBOB_LOG_PATH}/cbob_restore_check.log"
+    mkdir -p "$(dirname "$log_file")"
+    exec &> >(tee -a "$log_file")
+    
+    info "Crunchy Bridge Off-site Backup Restore Check v${CBOB_VERSION}"
+    info "Starting at $(date)"
+    
+    # Get stanzas to check
+    local stanzas=()
+    if [ -n "$target_stanza" ]; then
+        stanzas=("$target_stanza")
+    else
+        stanzas=($(get_all_stanzas))
+    fi
+    
+    if [ ${#stanzas[@]} -eq 0 ]; then
+        error "No stanzas found"
+    fi
+    
+    info "Stanzas to check: ${stanzas[*]}"
+    notify ":mag: CBOB Restore Check starting (${#stanzas[@]} stanzas)"
+
+    # Set report directory
+    if [ -z "$report_dir" ]; then
+        report_dir="${CBOB_BASE_PATH}/restores/reports/$(date +%Y%m%d_%H%M%S)"
+    fi
+    mkdir -p "$report_dir"
+    
+    # Check stanzas
+    local failed_stanzas=()
+    local success_count=0
+    local report_files=()
+    
+    if [ "$parallel" -gt 1 ] && command -v parallel &> /dev/null; then
+        info "Running parallel checks with $parallel workers"
+        
+        export -f check_stanza
+        export -f info warning error debug
+        
+        printf '%s\n' "${stanzas[@]}" | \
+            parallel -j "$parallel" check_stanza {} "$skip_checkdb" "$report_dir" || true
+    else
+        # Sequential check
+        for stanza in "${stanzas[@]}"; do
+            if check_stanza "$stanza" "$skip_checkdb" "$report_dir"; then
+                ((success_count++))
+                
+                # Collect report files
+                local report_file="$report_dir/${stanza}_restore_report.txt"
+                if [ -f "$report_file" ]; then
+                    report_files+=("$report_file")
+                fi
+            else
+                failed_stanzas+=("$stanza")
+            fi
+        done
+    fi
+    
+    # Send heartbeat if configured
+    if [ -n "${CBOB_RESTORE_HEARTBEAT_URL:-}" ]; then
+        send_heartbeat "$CBOB_RESTORE_HEARTBEAT_URL" "restore_check_complete"
+    fi
+    
+    # Send email if requested
+    if [ "$send_email" = true ] && [ ${#report_files[@]} -gt 0 ]; then
+        send_email_report "${report_files[@]}"
+    fi
+    
+    # Summary
+    info "Restore check summary:"
+    info "  Total stanzas: ${#stanzas[@]}"
+    info "  Successful: $success_count"
+    info "  Failed: ${#failed_stanzas[@]}"
+    
+    if [ ${#failed_stanzas[@]} -gt 0 ]; then
+        warning "Failed stanzas: ${failed_stanzas[*]}"
+        exit 1
+    fi
+    
+    info "✓ All restore checks passed!"
+    notify ":white_check_mark: CBOB Restore Check completed! ${#stanzas[@]} stanzas verified successfully."
+}
+
+# Run main function
+main "$@"

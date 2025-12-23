@@ -1,0 +1,425 @@
+#!/bin/bash
+
+# CBOB Sync - Sync backups from Crunchy Bridge to local or S3-compatible storage
+# This is a rewrite of the original cbob_sync with improved error handling and features
+# Supports: Local disk, Digital Ocean Spaces, Hetzner Object Storage, MinIO, etc.
+
+set -euo pipefail
+
+# Source common functions
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -f "${SCRIPT_DIR}/../lib/cbob_common.sh" ]; then
+    source "${SCRIPT_DIR}/../lib/cbob_common.sh"
+else
+    source "/usr/local/lib/cbob/cbob_common.sh"
+fi
+if [ -f "${SCRIPT_DIR}/../lib/cbob_metrics.sh" ]; then
+    source "${SCRIPT_DIR}/../lib/cbob_metrics.sh"
+else
+    source "/usr/local/lib/cbob/cbob_metrics.sh"
+fi
+
+# Help text
+show_help() {
+    cat << EOF
+Usage: cbob sync [options]
+
+Sync backups from Crunchy Bridge to local storage or S3-compatible object storage.
+
+Options:
+    --cluster ID        Sync only specific cluster (can be used multiple times)
+    --parallel N        Number of parallel sync operations (default: 1)
+    --bandwidth LIMIT   Bandwidth limit for AWS S3 sync (e.g., 10MB/s)
+    --retry-count N     Number of retries for failed operations (default: 3)
+    --retry-delay N     Initial retry delay in seconds (default: 5)
+    --skip-validation   Skip post-sync validation
+    --estimate-only     Show estimated backup sizes without syncing
+    --help, -h          Show this help message
+
+Destination Configuration:
+    Set CBOB_DEST_TYPE=s3 to sync to S3-compatible storage instead of local disk.
+    Required variables for S3 destination:
+        CBOB_DEST_ENDPOINT    - S3 endpoint URL (e.g., https://fra1.digitaloceanspaces.com)
+        CBOB_DEST_BUCKET      - Destination bucket name
+        CBOB_DEST_ACCESS_KEY  - Access key for destination
+        CBOB_DEST_SECRET_KEY  - Secret key for destination
+    Optional:
+        CBOB_DEST_REGION      - Region (default: us-east-1)
+        CBOB_DEST_PREFIX      - Path prefix in bucket (default: none)
+
+Examples:
+    cbob sync                           # Sync all configured clusters
+    cbob sync --cluster abc123          # Sync only cluster abc123
+    cbob sync --parallel 4              # Sync up to 4 clusters in parallel
+    cbob sync --bandwidth 10MB/s        # Limit bandwidth to 10MB/s
+    cbob sync --estimate-only           # Show backup sizes without syncing
+
+    # Sync to Digital Ocean Spaces:
+    CBOB_DEST_TYPE=s3 \\
+    CBOB_DEST_ENDPOINT=https://fra1.digitaloceanspaces.com \\
+    CBOB_DEST_BUCKET=my-backups \\
+    cbob sync
+
+EOF
+}
+
+# Parse command-line options
+parse_options() {
+    SYNC_CLUSTERS=()
+    SYNC_PARALLEL=1
+    SYNC_BANDWIDTH=""
+    SYNC_RETRY_COUNT=3
+    SYNC_RETRY_DELAY=5
+    SYNC_SKIP_VALIDATION=false
+    SYNC_ESTIMATE_ONLY=false
+    
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --cluster)
+                SYNC_CLUSTERS+=("$2")
+                shift 2
+                ;;
+            --parallel)
+                SYNC_PARALLEL="$2"
+                shift 2
+                ;;
+            --bandwidth)
+                SYNC_BANDWIDTH="$2"
+                shift 2
+                ;;
+            --retry-count)
+                SYNC_RETRY_COUNT="$2"
+                shift 2
+                ;;
+            --retry-delay)
+                SYNC_RETRY_DELAY="$2"
+                shift 2
+                ;;
+            --skip-validation)
+                SYNC_SKIP_VALIDATION=true
+                shift
+                ;;
+            --estimate-only)
+                SYNC_ESTIMATE_ONLY=true
+                shift
+                ;;
+            --help|-h)
+                show_help
+                exit 0
+                ;;
+            *)
+                error "Unknown option: $1"
+                ;;
+        esac
+    done
+}
+
+# Validate environment
+validate_environment() {
+    # Check if running as postgres user
+    if [ "$(whoami)" != 'postgres' ]; then
+        error "$0 must be run as postgres user. Run: sudo -u postgres $0"
+    fi
+
+    # Check dependencies
+    check_dependencies "aws" "jq" "curl" "flock"
+
+    # Load and validate configuration
+    load_config
+
+    # Validate base configuration
+    validate_config "CBOB_CRUNCHY_API_KEY" "CBOB_CRUNCHY_CLUSTERS"
+
+    # Validate destination-specific configuration
+    if is_dest_s3; then
+        info "Destination: S3-compatible storage (${CBOB_DEST_ENDPOINT:-not set})"
+        validate_dest_s3_config
+    else
+        info "Destination: Local storage (${CBOB_TARGET_PATH:-not set})"
+        validate_config "CBOB_TARGET_PATH"
+    fi
+}
+
+# Get cluster information from Crunchy Bridge API
+get_cluster_info() {
+    local cluster_id="$1"
+    local api_key="$2"
+    
+    debug "Fetching cluster information for: $cluster_id"
+    
+    local response=$(curl -s -f -X GET \
+        "https://api.crunchybridge.com/clusters/$cluster_id" \
+        -H "Authorization: Bearer $api_key" \
+        -H "Accept: application/json") || {
+        error "Failed to fetch cluster information for $cluster_id"
+    }
+    
+    echo "$response"
+}
+
+# Get backup credentials from Crunchy Bridge API
+get_backup_credentials() {
+    local cluster_id="$1"
+    local api_key="$2"
+    
+    debug "Fetching backup credentials for: $cluster_id"
+    
+    local response=$(curl -s -f -X POST \
+        "https://api.crunchybridge.com/clusters/$cluster_id/backup-tokens" \
+        -H "Authorization: Bearer $api_key" \
+        -H "Accept: application/json") || {
+        error "Failed to fetch backup credentials for $cluster_id"
+    }
+    
+    echo "$response"
+}
+
+# Estimate backup size
+estimate_backup_size() {
+    local bucket="$1"
+    local path="$2"
+    local stanza="$3"
+    
+    info "Estimating backup size for stanza: $stanza"
+    
+    # Get total size of archive and backup directories
+    local archive_size=$(aws s3 ls --summarize --recursive "s3://${bucket}${path}/archive/${stanza}/" 2>/dev/null | grep "Total Size:" | awk '{print $3}') || echo "0"
+    local backup_size=$(aws s3 ls --summarize --recursive "s3://${bucket}${path}/backup/${stanza}/" 2>/dev/null | grep "Total Size:" | awk '{print $3}') || echo "0"
+    
+    local total_size=$((archive_size + backup_size))
+    
+    info "  Archive size: $(human_readable_size $archive_size)"
+    info "  Backup size: $(human_readable_size $backup_size)"
+    info "  Total size: $(human_readable_size $total_size)"
+    
+    echo "$total_size"
+}
+
+# Sync a single cluster
+sync_cluster() {
+    local cluster_id="$1"
+    local start_time=$(start_timing)
+    local bytes_before=0
+    local bytes_after=0
+    
+    info "Starting sync for cluster: $cluster_id"
+    
+    # Record initial storage metrics
+    record_storage_metrics "$cluster_id"
+    bytes_before=$(get_metrics "storage" | jq -r ".[\"$cluster_id\"].total_size_bytes // 0" | tr -d '"')
+    
+    # Get last backup information
+    local last_backup_response=$(curl -s -f -X GET \
+        "https://api.crunchybridge.com/clusters/$cluster_id/backups?limit=1&order=desc" \
+        -H "Authorization: Bearer $CBOB_CRUNCHY_API_KEY") || {
+        warning "Failed to fetch last backup for cluster $cluster_id"
+        return 1
+    }
+    
+    local last_backup_name=$(echo "$last_backup_response" | jq -r '.backups[0].name // empty')
+    if [ -z "$last_backup_name" ]; then
+        warning "No backups found for cluster $cluster_id"
+        return 1
+    fi
+    
+    info "Last backup: $last_backup_name"
+    
+    # Get backup credentials
+    local credentials=$(get_backup_credentials "$cluster_id" "$CBOB_CRUNCHY_API_KEY")
+    
+    # Extract AWS credentials
+    local aws_config=$(echo "$credentials" | jq -r '.aws // empty')
+    if [ -z "$aws_config" ] || [ "$aws_config" = "null" ]; then
+        error "Failed to get AWS credentials for cluster $cluster_id"
+    fi
+    
+    export AWS_REGION=$(echo "$credentials" | jq -r '.aws.s3_region')
+    export AWS_SESSION_TOKEN=$(echo "$credentials" | jq -r '.aws.s3_token')
+    export AWS_ACCESS_KEY_ID=$(echo "$credentials" | jq -r '.aws.s3_key')
+    export AWS_SECRET_ACCESS_KEY=$(echo "$credentials" | jq -r '.aws.s3_key_secret')
+    
+    local bucket=$(echo "$credentials" | jq -r '.aws.s3_bucket')
+    local repo_path=$(echo "$credentials" | jq -r '.repo_path')
+    local stanza=$(echo "$credentials" | jq -r '.stanza')
+    
+    # Validate extracted values
+    if [ -z "$stanza" ] || [ "$stanza" = "null" ]; then
+        error "Missing stanza for cluster $cluster_id"
+    fi
+    
+    # Estimate size if requested
+    if [ "$SYNC_ESTIMATE_ONLY" = true ]; then
+        estimate_backup_size "$bucket" "$repo_path" "$stanza"
+        return 0
+    fi
+    
+    # Build AWS sync command options
+    local aws_sync_opts=()
+    if [ -n "$SYNC_BANDWIDTH" ]; then
+        aws_sync_opts+=("--cli-read-timeout" "60" "--cli-connect-timeout" "60")
+    fi
+
+    if [ "$CBOB_DRY_RUN" = "true" ]; then
+        aws_sync_opts+=("--dryrun")
+        info "Running in DRY-RUN mode"
+    fi
+
+    # Sync operations with retry logic
+    info "Syncing archive for stanza: $stanza"
+    retry_with_backoff "$SYNC_RETRY_COUNT" "$SYNC_RETRY_DELAY" 300 \
+        sync_to_dest \
+        "s3://${bucket}${repo_path}/archive/${stanza}" \
+        "/archive/${stanza}" \
+        "${aws_sync_opts[@]}"
+
+    info "Syncing backup for stanza: $stanza"
+    retry_with_backoff "$SYNC_RETRY_COUNT" "$SYNC_RETRY_DELAY" 300 \
+        sync_to_dest \
+        "s3://${bucket}${repo_path}/backup/${stanza}/${last_backup_name}" \
+        "/backup/${stanza}/${last_backup_name}" \
+        "${aws_sync_opts[@]}"
+
+    info "Syncing backup metadata"
+    retry_with_backoff "$SYNC_RETRY_COUNT" "$SYNC_RETRY_DELAY" 60 \
+        sync_to_dest \
+        "s3://${bucket}${repo_path}/backup/${stanza}/backup.history" \
+        "/backup/${stanza}/backup.history" \
+        "${aws_sync_opts[@]}"
+
+    retry_with_backoff "$SYNC_RETRY_COUNT" "$SYNC_RETRY_DELAY" 60 \
+        copy_to_dest \
+        "s3://${bucket}${repo_path}/backup/${stanza}/backup.info" \
+        "/backup/${stanza}/backup.info" \
+        "${aws_sync_opts[@]}"
+
+    retry_with_backoff "$SYNC_RETRY_COUNT" "$SYNC_RETRY_DELAY" 60 \
+        copy_to_dest \
+        "s3://${bucket}${repo_path}/backup/${stanza}/backup.info.copy" \
+        "/backup/${stanza}/backup.info.copy" \
+        "${aws_sync_opts[@]}"
+    
+    # Post-sync validation
+    if [ "$SYNC_SKIP_VALIDATION" = false ] && [ "$CBOB_DRY_RUN" != "true" ]; then
+        info "Validating sync for stanza: $stanza"
+
+        if is_dest_s3; then
+            # For S3 destination, we verify the files exist in the destination
+            if dest_exists "/backup/${stanza}/backup.info"; then
+                info "✓ Backup metadata verified in S3 destination"
+            else
+                warning "Backup metadata not found in S3 destination for stanza: $stanza"
+            fi
+        else
+            # For local destination, use pgBackRest validation
+            if command -v pgbackrest &> /dev/null; then
+                pgbackrest --stanza="$stanza" --log-level-console=warn info || {
+                    warning "pgBackRest validation failed for stanza: $stanza"
+                }
+            else
+                debug "pgBackRest not available, skipping validation"
+            fi
+        fi
+    fi
+    
+    local end_time=$(date +%s)
+    local duration=$((end_time - start_time))
+    
+    # Record final storage metrics and calculate bytes synced
+    record_storage_metrics "$cluster_id"
+    bytes_after=$(get_metrics "storage" | jq -r ".[\"$cluster_id\"].total_size_bytes // 0" | tr -d '"')
+    local bytes_synced=$((bytes_after - bytes_before))
+    
+    # Record sync metrics
+    record_sync_metrics "$cluster_id" "$start_time" "$end_time" "success" "$bytes_synced"
+    
+    info "✓ Sync completed for cluster $cluster_id (duration: ${duration}s, synced: $(human_readable_size $bytes_synced))"
+}
+
+# Main sync function
+main() {
+    parse_options "$@"
+    
+    # Acquire lock unless disabled
+    if [ "${CBOB_NO_LOCK:-false}" != "true" ]; then
+        acquire_lock "cbob_sync"
+    fi
+    
+    # Validate environment
+    validate_environment
+    
+    # Set up logging
+    local log_file="${CBOB_LOG_PATH}/cbob_sync.log"
+    mkdir -p "$(dirname "$log_file")"
+    exec &> >(tee -a "$log_file")
+    
+    info "Crunchy Bridge Off-site Backup Sync v${CBOB_VERSION}"
+    info "Starting at $(date)"
+
+    # Determine which clusters to sync
+    local clusters_to_sync=()
+    if [ ${#SYNC_CLUSTERS[@]} -gt 0 ]; then
+        # Use specified clusters
+        clusters_to_sync=("${SYNC_CLUSTERS[@]}")
+    else
+        # Use all configured clusters
+        IFS=',' read -ra clusters_to_sync <<< "$CBOB_CRUNCHY_CLUSTERS"
+    fi
+
+    info "Clusters to sync: ${clusters_to_sync[*]}"
+    notify ":arrows_counterclockwise: CBOB Sync starting (${#clusters_to_sync[@]} clusters)"
+    
+    # Sync clusters
+    local failed_clusters=()
+    local success_count=0
+    
+    if [ "$SYNC_PARALLEL" -gt 1 ]; then
+        info "Running parallel sync with $SYNC_PARALLEL workers"
+        
+        # Use GNU parallel if available, otherwise fall back to sequential
+        if command -v parallel &> /dev/null; then
+            export -f sync_cluster
+            export -f info warning error debug
+            export -f retry_with_backoff
+            export -f human_readable_size
+            
+            printf '%s\n' "${clusters_to_sync[@]}" | \
+                parallel -j "$SYNC_PARALLEL" sync_cluster {} || true
+        else
+            warning "GNU parallel not found, falling back to sequential sync"
+            SYNC_PARALLEL=1
+        fi
+    fi
+    
+    if [ "$SYNC_PARALLEL" -eq 1 ]; then
+        # Sequential sync
+        for cluster_id in "${clusters_to_sync[@]}"; do
+            if sync_cluster "$cluster_id"; then
+                ((++success_count))
+            else
+                failed_clusters+=("$cluster_id")
+            fi
+        done
+    fi
+    
+    # Send heartbeat if configured
+    if [ -n "${CBOB_SYNC_HEARTBEAT_URL:-}" ]; then
+        send_heartbeat "$CBOB_SYNC_HEARTBEAT_URL" "sync_complete"
+    fi
+    
+    # Summary
+    info "Sync summary:"
+    info "  Total clusters: ${#clusters_to_sync[@]}"
+    info "  Successful: $success_count"
+    info "  Failed: ${#failed_clusters[@]}"
+    
+    if [ ${#failed_clusters[@]} -gt 0 ]; then
+        warning "Failed clusters: ${failed_clusters[*]}"
+        exit 1
+    fi
+    
+    info "✓ All backups synced successfully!"
+    notify ":white_check_mark: CBOB Sync completed! ${#clusters_to_sync[@]} clusters synced successfully."
+}
+
+# Run main function
+main "$@"

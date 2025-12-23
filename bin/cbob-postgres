@@ -1,0 +1,353 @@
+#!/bin/bash
+
+# CBOB Postgres - Manage local PostgreSQL instances
+# Control PostgreSQL clusters for restore testing
+
+set -euo pipefail
+
+# Source common functions
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -f "${SCRIPT_DIR}/../lib/cbob_common.sh" ]; then
+    source "${SCRIPT_DIR}/../lib/cbob_common.sh"
+else
+    source "/usr/local/lib/cbob/cbob_common.sh"
+fi
+
+# Help text
+show_help() {
+    cat << EOF
+Usage: cbob postgres <subcommand> [options]
+
+Manage local PostgreSQL instances for restore testing.
+
+Subcommands:
+    start       Start all PostgreSQL clusters
+    stop        Stop all PostgreSQL clusters
+    restart     Restart all PostgreSQL clusters
+    status      Show status of all clusters
+    initdb      Initialize PostgreSQL data directories
+    list        List all configured clusters
+    help        Show this help message
+
+Options:
+    --cluster ID    Operate on specific cluster only
+    --force         Force operation without confirmation
+    --help, -h      Show this help message
+
+Examples:
+    cbob postgres start                 # Start all clusters
+    cbob postgres stop --cluster abc123 # Stop specific cluster
+    cbob postgres status               # Show cluster status
+    cbob postgres initdb              # Initialize data directories
+
+EOF
+}
+
+# Get cluster information
+get_clusters() {
+    load_config
+    validate_config "CBOB_CRUNCHY_CLUSTERS" "CBOB_BASE_PATH"
+    
+    IFS=',' read -ra CLUSTERS <<< "$CBOB_CRUNCHY_CLUSTERS"
+    echo "${CLUSTERS[@]}"
+}
+
+# Get PostgreSQL binary path
+get_pg_bin() {
+    local version="${CBOB_PG_VERSION:-18}"
+    echo "/usr/lib/postgresql/${version}/bin"
+}
+
+# Get data directory for cluster
+get_data_dir() {
+    local cluster_id="$1"
+    local version="${CBOB_PG_VERSION:-18}"
+    echo "${CBOB_BASE_PATH}/postgresql/${version}/${cluster_id}"
+}
+
+# Get log file for cluster
+get_log_file() {
+    local cluster_id="$1"
+    local version="${CBOB_PG_VERSION:-18}"
+    echo "${CBOB_BASE_PATH}/log/postgresql/postgresql-${version}-${cluster_id}.log"
+}
+
+# Get port for cluster
+get_cluster_port() {
+    local cluster_id="$1"
+    local base_port=5432
+    local index=0
+    
+    # Get cluster index
+    local clusters=($(get_clusters))
+    for i in "${!clusters[@]}"; do
+        if [ "${clusters[$i]}" = "$cluster_id" ]; then
+            index=$i
+            break
+        fi
+    done
+    
+    echo $((base_port + index))
+}
+
+# Check if cluster is running
+is_cluster_running() {
+    local cluster_id="$1"
+    local data_dir=$(get_data_dir "$cluster_id")
+    local pg_bin=$(get_pg_bin)
+    
+    if [ ! -d "$data_dir" ]; then
+        return 1
+    fi
+    
+    sudo -u postgres "${pg_bin}/pg_ctl" -D "$data_dir" status >/dev/null 2>&1
+}
+
+# Start cluster
+start_cluster() {
+    local cluster_id="$1"
+    local data_dir=$(get_data_dir "$cluster_id")
+    local log_file=$(get_log_file "$cluster_id")
+    local pg_bin=$(get_pg_bin)
+    
+    if is_cluster_running "$cluster_id"; then
+        warning "Cluster $cluster_id is already running"
+        return 0
+    fi
+    
+    if [ ! -d "$data_dir" ]; then
+        error "Data directory not found for cluster $cluster_id. Run 'cbob postgres initdb' first."
+    fi
+    
+    info "Starting PostgreSQL cluster: $cluster_id"
+    
+    # Ensure log directory exists
+    mkdir -p "$(dirname "$log_file")"
+    chown postgres:postgres "$(dirname "$log_file")"
+    
+    # Start PostgreSQL
+    sudo -u postgres "${pg_bin}/pg_ctl" \
+        -D "$data_dir" \
+        -l "$log_file" \
+        -o "-p $(get_cluster_port "$cluster_id")" \
+        start
+    
+    # Wait for startup
+    local retries=30
+    while [ $retries -gt 0 ]; do
+        if is_cluster_running "$cluster_id"; then
+            info "✓ Cluster $cluster_id started successfully on port $(get_cluster_port "$cluster_id")"
+            return 0
+        fi
+        sleep 1
+        ((retries--))
+    done
+    
+    error "Failed to start cluster $cluster_id"
+}
+
+# Stop cluster
+stop_cluster() {
+    local cluster_id="$1"
+    local data_dir=$(get_data_dir "$cluster_id")
+    local pg_bin=$(get_pg_bin)
+    
+    if ! is_cluster_running "$cluster_id"; then
+        warning "Cluster $cluster_id is not running"
+        return 0
+    fi
+    
+    info "Stopping PostgreSQL cluster: $cluster_id"
+    
+    sudo -u postgres "${pg_bin}/pg_ctl" \
+        -D "$data_dir" \
+        -m fast \
+        stop
+    
+    info "✓ Cluster $cluster_id stopped"
+}
+
+# Initialize cluster
+init_cluster() {
+    local cluster_id="$1"
+    local data_dir=$(get_data_dir "$cluster_id")
+    local pg_bin=$(get_pg_bin)
+    local port=$(get_cluster_port "$cluster_id")
+    
+    if [ -d "$data_dir" ] && [ "$(ls -A "$data_dir")" ]; then
+        warning "Data directory already exists for cluster $cluster_id"
+        read -p "Remove existing data directory? (y/N) " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            rm -rf "$data_dir"
+        else
+            return 0
+        fi
+    fi
+    
+    info "Initializing PostgreSQL cluster: $cluster_id"
+    
+    # Create data directory
+    mkdir -p "$data_dir"
+    chown postgres:postgres "$data_dir"
+    chmod 700 "$data_dir"
+    
+    # Initialize database
+    sudo -u postgres "${pg_bin}/initdb" -D "$data_dir"
+    
+    # Update postgresql.conf
+    local conf_file="$data_dir/postgresql.conf"
+    if [ -f "${CBOB_ROOT}/etc/postgresql.template.conf" ]; then
+        cp "${CBOB_ROOT}/etc/postgresql.template.conf" "$conf_file"
+    else
+        # Basic configuration
+        cat >> "$conf_file" << EOF
+
+# CBOB Configuration
+port = $port
+max_connections = 100
+shared_buffers = 128MB
+archive_mode = on
+archive_command = 'pgbackrest --stanza=%s archive-push %p'
+max_wal_senders = 3
+wal_level = replica
+EOF
+    fi
+    
+    # Get stanza for this cluster
+    local credentials=$(curl -s -X POST \
+        "https://api.crunchybridge.com/clusters/$cluster_id/backup-tokens" \
+        -H "Authorization: Bearer $CBOB_CRUNCHY_API_KEY" 2>/dev/null || echo "{}")
+    
+    local stanza=$(echo "$credentials" | jq -r '.stanza // empty')
+    
+    if [ -n "$stanza" ]; then
+        sed -i "s/{{stanza}}/$stanza/g" "$conf_file"
+    fi
+    sed -i "s/{{port}}/$port/g" "$conf_file"
+    
+    chown postgres:postgres "$conf_file"
+    
+    info "✓ Cluster $cluster_id initialized"
+}
+
+# Show cluster status
+show_status() {
+    local clusters=($(get_clusters))
+    
+    echo "PostgreSQL Cluster Status"
+    echo "========================"
+    echo
+    printf "%-20s %-10s %-6s %-30s\n" "CLUSTER ID" "STATUS" "PORT" "DATA DIRECTORY"
+    printf "%-20s %-10s %-6s %-30s\n" "----------" "------" "----" "--------------"
+    
+    for cluster_id in "${clusters[@]}"; do
+        local status="stopped"
+        local port=$(get_cluster_port "$cluster_id")
+        local data_dir=$(get_data_dir "$cluster_id")
+        
+        if is_cluster_running "$cluster_id"; then
+            status="running"
+        elif [ ! -d "$data_dir" ]; then
+            status="not init"
+        fi
+        
+        printf "%-20s %-10s %-6s %-30s\n" "$cluster_id" "$status" "$port" "$data_dir"
+    done
+}
+
+# Main function
+main() {
+    local subcommand="${1:-help}"
+    shift || true
+    
+    local target_cluster=""
+    local force=false
+    
+    # Parse options
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --cluster)
+                target_cluster="$2"
+                shift 2
+                ;;
+            --force)
+                force=true
+                shift
+                ;;
+            --help|-h)
+                show_help
+                exit 0
+                ;;
+            *)
+                error "Unknown option: $1"
+                ;;
+        esac
+    done
+    
+    # Get clusters to operate on
+    local clusters=()
+    if [ -n "$target_cluster" ]; then
+        clusters=("$target_cluster")
+    else
+        clusters=($(get_clusters))
+    fi
+    
+    case "$subcommand" in
+        start)
+            for cluster_id in "${clusters[@]}"; do
+                start_cluster "$cluster_id"
+            done
+            ;;
+            
+        stop)
+            if [ "$force" != true ] && [ -z "$target_cluster" ]; then
+                read -p "Stop all PostgreSQL clusters? (y/N) " -n 1 -r
+                echo
+                if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+                    info "Operation cancelled"
+                    exit 0
+                fi
+            fi
+            
+            for cluster_id in "${clusters[@]}"; do
+                stop_cluster "$cluster_id"
+            done
+            ;;
+            
+        restart)
+            for cluster_id in "${clusters[@]}"; do
+                stop_cluster "$cluster_id"
+                start_cluster "$cluster_id"
+            done
+            ;;
+            
+        status)
+            show_status
+            ;;
+            
+        initdb)
+            for cluster_id in "${clusters[@]}"; do
+                init_cluster "$cluster_id"
+            done
+            ;;
+            
+        list)
+            echo "Configured clusters:"
+            for cluster_id in "${clusters[@]}"; do
+                echo "  - $cluster_id"
+            done
+            ;;
+            
+        help|--help|-h)
+            show_help
+            ;;
+            
+        *)
+            error "Unknown subcommand: $subcommand"
+            ;;
+    esac
+}
+
+# Run main function
+main "$@"

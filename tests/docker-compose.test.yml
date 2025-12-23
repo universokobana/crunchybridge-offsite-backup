@@ -1,0 +1,70 @@
+# Docker Compose for CBOB E2E Testing
+# Tests the full backup -> sync -> restore flow
+#
+# Components:
+# - postgres-source: Source PostgreSQL (18)
+# - minio-source: Simulates Crunchy Bridge S3 (backup source)
+# - minio-dest: Destination S3-compatible storage
+
+services:
+  # MinIO as source (simulates Crunchy Bridge S3)
+  minio-source:
+    image: minio/minio:latest
+    container_name: cbob-test-minio-source
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: sourceuser
+      MINIO_ROOT_PASSWORD: sourcepass123
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-source-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # MinIO as destination (where CBOB syncs to)
+  minio-dest:
+    image: minio/minio:latest
+    container_name: cbob-test-minio-dest
+    command: server /data --console-address ":9003"
+    environment:
+      MINIO_ROOT_USER: destuser
+      MINIO_ROOT_PASSWORD: destpass123
+    ports:
+      - "9002:9000"
+      - "9003:9003"
+    volumes:
+      - minio-dest-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Source PostgreSQL (using port 5433 to avoid conflicts with local PostgreSQL)
+  # Note: PostgreSQL 18+ requires mounting at /var/lib/postgresql (not /data subdirectory)
+  postgres-source:
+    image: postgres:18
+    container_name: cbob-test-postgres-source
+    environment:
+      POSTGRES_USER: testuser
+      POSTGRES_PASSWORD: testpass123
+      POSTGRES_DB: testdb
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres-source-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U testuser -d testdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  minio-source-data:
+  minio-dest-data:
+  postgres-source-data:

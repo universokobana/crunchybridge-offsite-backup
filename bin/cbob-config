@@ -1,0 +1,559 @@
+#!/bin/bash
+
+# CBOB Config - Configuration management for CBOB
+# Validate, show, and manage CBOB configuration
+
+set -euo pipefail
+
+# Source common functions
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -f "${SCRIPT_DIR}/../lib/cbob_common.sh" ]; then
+    source "${SCRIPT_DIR}/../lib/cbob_common.sh"
+else
+    source "/usr/local/lib/cbob/cbob_common.sh"
+fi
+
+# Configuration schema
+declare -A CONFIG_SCHEMA=(
+    ["CBOB_CRUNCHY_API_KEY"]="required:string:Crunchy Bridge API key"
+    ["CBOB_CRUNCHY_CLUSTERS"]="required:string:Comma-separated cluster IDs"
+    ["CBOB_TARGET_PATH"]="conditional:path:Target path for backups (required if DEST_TYPE=local)"
+    ["CBOB_BASE_PATH"]="optional:path:Base path for all CBOB data"
+    ["CBOB_LOG_PATH"]="optional:path:Log directory path"
+    ["CBOB_PG_VERSION"]="optional:number:PostgreSQL version"
+    ["CBOB_RETENTION_FULL"]="optional:number:Number of full backups to retain"
+    ["CBOB_DRY_RUN"]="optional:boolean:Enable dry-run mode"
+    ["CBOB_SLACK_CLI_TOKEN"]="optional:string:Slack CLI token"
+    ["CBOB_SLACK_CHANNEL"]="optional:string:Slack channel for notifications"
+    ["CBOB_SYNC_HEARTBEAT_URL"]="optional:url:Heartbeat URL for sync"
+    ["CBOB_RESTORE_HEARTBEAT_URL"]="optional:url:Heartbeat URL for restore"
+    # S3-compatible destination configuration
+    ["CBOB_DEST_TYPE"]="optional:desttype:Destination type (local or s3)"
+    ["CBOB_DEST_ENDPOINT"]="conditional:url:S3 endpoint URL (required if DEST_TYPE=s3)"
+    ["CBOB_DEST_BUCKET"]="conditional:string:S3 destination bucket (required if DEST_TYPE=s3)"
+    ["CBOB_DEST_ACCESS_KEY"]="conditional:string:S3 destination access key (required if DEST_TYPE=s3)"
+    ["CBOB_DEST_SECRET_KEY"]="conditional:string:S3 destination secret key (required if DEST_TYPE=s3)"
+    ["CBOB_DEST_REGION"]="optional:string:S3 destination region"
+    ["CBOB_DEST_PREFIX"]="optional:string:S3 destination path prefix"
+)
+
+# Help text
+show_help() {
+    cat << EOF
+Usage: cbob config <subcommand> [options]
+
+Configuration management for CBOB.
+
+Subcommands:
+    validate    Validate current configuration
+    show        Show current configuration (with sensitive data masked)
+    init        Initialize configuration interactively
+    get KEY     Get a specific configuration value
+    set KEY VAL Set a specific configuration value
+    help        Show this help message
+
+Options:
+    --file FILE     Use specific configuration file
+    --format FORMAT Output format (text, json, env)
+    --unmask        Show sensitive values unmasked
+    --help, -h      Show this help message
+
+Examples:
+    cbob config validate                    # Validate current configuration
+    cbob config show                        # Show configuration with masked secrets
+    cbob config show --unmask               # Show configuration with secrets
+    cbob config get CBOB_TARGET_PATH        # Get specific value
+    cbob config set CBOB_LOG_PATH /var/log  # Set specific value
+
+EOF
+}
+
+# Mask sensitive values
+mask_value() {
+    local key="$1"
+    local value="$2"
+    
+    case "$key" in
+        *API_KEY*|*TOKEN*|*SECRET*|*PASSWORD*)
+            if [ ${#value} -gt 8 ]; then
+                echo "${value:0:4}...${value: -4}"
+            else
+                echo "****"
+            fi
+            ;;
+        *)
+            echo "$value"
+            ;;
+    esac
+}
+
+# Validate a single configuration value
+validate_value() {
+    local key="$1"
+    local value="$2"
+    local schema="${CONFIG_SCHEMA[$key]:-optional:string:Unknown configuration}"
+
+    IFS=':' read -r requirement type description <<< "$schema"
+
+    # Check if required
+    if [ "$requirement" = "required" ] && [ -z "$value" ]; then
+        return 1
+    fi
+
+    # Handle conditional requirements based on CBOB_DEST_TYPE
+    if [ "$requirement" = "conditional" ]; then
+        local dest_type="${CBOB_DEST_TYPE:-local}"
+        case "$key" in
+            CBOB_TARGET_PATH)
+                # Required only if destination is local
+                if [ "$dest_type" = "local" ] && [ -z "$value" ]; then
+                    return 1
+                fi
+                ;;
+            CBOB_DEST_ENDPOINT|CBOB_DEST_BUCKET|CBOB_DEST_ACCESS_KEY|CBOB_DEST_SECRET_KEY)
+                # Required only if destination is s3
+                if [ "$dest_type" = "s3" ] && [ -z "$value" ]; then
+                    return 1
+                fi
+                ;;
+        esac
+    fi
+
+    # Skip validation if optional and empty
+    if [ -z "$value" ]; then
+        return 0
+    fi
+
+    # Validate based on type
+    case "$type" in
+        string)
+            # Any non-empty string is valid
+            ;;
+        number)
+            if ! [[ "$value" =~ ^[0-9]+$ ]]; then
+                return 1
+            fi
+            ;;
+        boolean)
+            if ! [[ "$value" =~ ^(true|false|yes|no|1|0)$ ]]; then
+                return 1
+            fi
+            ;;
+        path)
+            # For paths, we just check if they're absolute
+            if ! [[ "$value" =~ ^/ ]]; then
+                warning "Path '$value' is not absolute"
+            fi
+            ;;
+        url)
+            if ! [[ "$value" =~ ^https?:// ]]; then
+                return 1
+            fi
+            ;;
+        desttype)
+            # Destination type must be 'local' or 's3'
+            if ! [[ "$value" =~ ^(local|s3)$ ]]; then
+                return 1
+            fi
+            ;;
+    esac
+
+    return 0
+}
+
+# Validate configuration
+validate_config_cmd() {
+    info "Validating CBOB configuration..."
+    
+    # Try to load config
+    load_config || {
+        error "Failed to load configuration"
+    }
+    
+    local errors=0
+    local warnings=0
+    
+    # Check all known configuration variables
+    for key in "${!CONFIG_SCHEMA[@]}"; do
+        local schema="${CONFIG_SCHEMA[$key]}"
+        IFS=':' read -r requirement type description <<< "$schema"
+        
+        local value="${!key:-}"
+        
+        if validate_value "$key" "$value"; then
+            if [ -n "$value" ]; then
+                debug "✓ $key: $(mask_value "$key" "$value")"
+            elif [ "$requirement" = "optional" ]; then
+                debug "○ $key: (not set)"
+            fi
+        else
+            if [ "$requirement" = "required" ]; then
+                error "✗ $key: Missing required configuration ($description)"
+                ((errors++))
+            else
+                warning "⚠ $key: Invalid value '$(mask_value "$key" "$value")' ($description)"
+                ((warnings++))
+            fi
+        fi
+    done
+    
+    # Additional validation checks
+    local dest_type="${CBOB_DEST_TYPE:-local}"
+    info "Destination type: $dest_type"
+
+    if [ "$dest_type" = "local" ]; then
+        # Check if target path exists and is writable
+        if [ -n "${CBOB_TARGET_PATH:-}" ]; then
+            if [ ! -d "$CBOB_TARGET_PATH" ]; then
+                warning "Target path does not exist: $CBOB_TARGET_PATH"
+                ((warnings++))
+            elif [ ! -w "$CBOB_TARGET_PATH" ]; then
+                error "Target path is not writable: $CBOB_TARGET_PATH"
+                ((errors++))
+            fi
+        fi
+    elif [ "$dest_type" = "s3" ]; then
+        # Validate S3 endpoint connectivity
+        if [ -n "${CBOB_DEST_ENDPOINT:-}" ]; then
+            info "S3 endpoint: ${CBOB_DEST_ENDPOINT}"
+            info "S3 bucket: ${CBOB_DEST_BUCKET:-not set}"
+
+            # Test S3 connectivity if credentials are set
+            if [ -n "${CBOB_DEST_ACCESS_KEY:-}" ] && [ -n "${CBOB_DEST_SECRET_KEY:-}" ]; then
+                debug "Testing S3 destination connectivity..."
+                if AWS_ACCESS_KEY_ID="${CBOB_DEST_ACCESS_KEY}" \
+                   AWS_SECRET_ACCESS_KEY="${CBOB_DEST_SECRET_KEY}" \
+                   AWS_DEFAULT_REGION="${CBOB_DEST_REGION:-us-east-1}" \
+                   aws --endpoint-url "${CBOB_DEST_ENDPOINT}" s3 ls "s3://${CBOB_DEST_BUCKET}/" >/dev/null 2>&1; then
+                    info "✓ S3 destination connectivity verified"
+                else
+                    warning "Could not connect to S3 destination (check credentials and endpoint)"
+                    ((warnings++))
+                fi
+            fi
+        fi
+    fi
+    
+    # Validate cluster IDs format
+    if [ -n "${CBOB_CRUNCHY_CLUSTERS:-}" ]; then
+        IFS=',' read -ra clusters <<< "$CBOB_CRUNCHY_CLUSTERS"
+        for cluster in "${clusters[@]}"; do
+            if ! [[ "$cluster" =~ ^[a-zA-Z0-9-]+$ ]]; then
+                error "Invalid cluster ID format: $cluster"
+                ((errors++))
+            fi
+        done
+    fi
+    
+    # Summary
+    info "Validation complete:"
+    info "  Errors: $errors"
+    info "  Warnings: $warnings"
+    
+    if [ $errors -gt 0 ]; then
+        error "Configuration validation failed"
+    elif [ $warnings -gt 0 ]; then
+        warning "Configuration has warnings but is valid"
+    else
+        info "✓ Configuration is valid"
+    fi
+}
+
+# Show configuration
+show_config() {
+    local format="${1:-text}"
+    local unmask="${2:-false}"
+    
+    # Try to load config
+    load_config || {
+        error "Failed to load configuration"
+    }
+    
+    case "$format" in
+        text)
+            echo "CBOB Configuration:"
+            echo "==================="
+            for key in "${!CONFIG_SCHEMA[@]}"; do
+                local value="${!key:-}"
+                if [ -n "$value" ]; then
+                    if [ "$unmask" = "true" ]; then
+                        printf "%-30s = %s\n" "$key" "$value"
+                    else
+                        printf "%-30s = %s\n" "$key" "$(mask_value "$key" "$value")"
+                    fi
+                fi
+            done | sort
+            ;;
+            
+        json)
+            echo "{"
+            local first=true
+            for key in "${!CONFIG_SCHEMA[@]}"; do
+                local value="${!key:-}"
+                if [ -n "$value" ]; then
+                    if [ "$first" = true ]; then
+                        first=false
+                    else
+                        echo ","
+                    fi
+                    if [ "$unmask" = "true" ]; then
+                        printf '  "%s": "%s"' "$key" "$value"
+                    else
+                        printf '  "%s": "%s"' "$key" "$(mask_value "$key" "$value")"
+                    fi
+                fi
+            done | sort
+            echo
+            echo "}"
+            ;;
+            
+        env)
+            for key in "${!CONFIG_SCHEMA[@]}"; do
+                local value="${!key:-}"
+                if [ -n "$value" ]; then
+                    if [ "$unmask" = "true" ]; then
+                        echo "export $key=\"$value\""
+                    else
+                        echo "export $key=\"$(mask_value "$key" "$value")\""
+                    fi
+                fi
+            done | sort
+            ;;
+            
+        *)
+            error "Unknown format: $format"
+            ;;
+    esac
+}
+
+# Get configuration value
+get_config() {
+    local key="$1"
+    
+    # Try to load config
+    load_config || {
+        error "Failed to load configuration"
+    }
+    
+    local value="${!key:-}"
+    if [ -z "$value" ]; then
+        error "Configuration key not found: $key"
+    fi
+    
+    echo "$value"
+}
+
+# Set configuration value
+set_config() {
+    local key="$1"
+    local value="$2"
+    local config_file="${CBOB_CONFIG_FILE:-/usr/local/etc/cb_offsite_backup}"
+    
+    # Validate the value
+    if ! validate_value "$key" "$value"; then
+        error "Invalid value for $key: $value"
+    fi
+    
+    # Check if config file exists
+    if [ ! -f "$config_file" ]; then
+        error "Configuration file not found: $config_file"
+    fi
+    
+    # Create backup
+    cp "$config_file" "${config_file}.bak"
+    
+    # Update or add the key
+    if grep -q "^${key}=" "$config_file"; then
+        # Update existing key
+        sed -i.tmp "s|^${key}=.*|${key}=${value}|" "$config_file"
+    else
+        # Add new key
+        echo "${key}=${value}" >> "$config_file"
+    fi
+    
+    # Remove temp file
+    rm -f "${config_file}.tmp"
+    
+    info "Configuration updated: $key = $(mask_value "$key" "$value")"
+}
+
+# Initialize configuration interactively
+init_config() {
+    local config_file="${CBOB_CONFIG_FILE:-/usr/local/etc/cb_offsite_backup}"
+    
+    info "CBOB Configuration Initialization"
+    echo
+    
+    # Check if config already exists
+    if [ -f "$config_file" ]; then
+        read -p "Configuration file already exists. Overwrite? (y/N) " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            info "Configuration initialization cancelled"
+            exit 0
+        fi
+        cp "$config_file" "${config_file}.bak"
+        info "Existing configuration backed up to: ${config_file}.bak"
+    fi
+    
+    # Initialize configuration
+    echo "# CBOB Configuration File" > "$config_file"
+    echo "# Generated on $(date)" >> "$config_file"
+    echo "" >> "$config_file"
+    
+    # First, ask for destination type
+    echo ""
+    echo "=== Destination Configuration ==="
+    read -p "Destination type (local or s3) [local]: " dest_type
+    dest_type="${dest_type:-local}"
+    echo "CBOB_DEST_TYPE=${dest_type}" >> "$config_file"
+    export CBOB_DEST_TYPE="$dest_type"
+
+    # Define which keys to prompt based on destination type
+    local base_keys=(CBOB_CRUNCHY_API_KEY CBOB_CRUNCHY_CLUSTERS)
+    local local_keys=(CBOB_TARGET_PATH CBOB_BASE_PATH)
+    local s3_keys=(CBOB_DEST_ENDPOINT CBOB_DEST_BUCKET CBOB_DEST_ACCESS_KEY CBOB_DEST_SECRET_KEY CBOB_DEST_REGION CBOB_DEST_PREFIX)
+    local common_keys=(CBOB_LOG_PATH CBOB_PG_VERSION CBOB_RETENTION_FULL CBOB_SLACK_CLI_TOKEN CBOB_SLACK_CHANNEL CBOB_SYNC_HEARTBEAT_URL CBOB_RESTORE_HEARTBEAT_URL)
+
+    local all_keys=("${base_keys[@]}")
+    if [ "$dest_type" = "local" ]; then
+        all_keys+=("${local_keys[@]}")
+    else
+        all_keys+=("${s3_keys[@]}")
+    fi
+    all_keys+=("${common_keys[@]}")
+
+    # Prompt for each configuration value
+    for key in "${all_keys[@]}"; do
+
+        local schema="${CONFIG_SCHEMA[$key]}"
+        IFS=':' read -r requirement type description <<< "$schema"
+
+        local prompt="$description"
+        if [ "$requirement" = "required" ]; then
+            prompt="$prompt (required)"
+        elif [ "$requirement" = "conditional" ]; then
+            if [ "$dest_type" = "s3" ] && [[ "$key" =~ ^CBOB_DEST_ ]]; then
+                prompt="$prompt (required for S3)"
+            elif [ "$dest_type" = "local" ] && [ "$key" = "CBOB_TARGET_PATH" ]; then
+                prompt="$prompt (required for local)"
+            else
+                prompt="$prompt (optional)"
+            fi
+        else
+            prompt="$prompt (optional)"
+        fi
+
+        # Get default value
+        local default="${!key:-}"
+        case "$key" in
+            CBOB_BASE_PATH)
+                default="${default:-/mnt/volume_cbob}"
+                ;;
+            CBOB_TARGET_PATH)
+                default="${default:-/mnt/backups}"
+                ;;
+            CBOB_LOG_PATH)
+                default="${default:-/var/log}"
+                ;;
+            CBOB_PG_VERSION)
+                default="${default:-17}"
+                ;;
+            CBOB_RETENTION_FULL)
+                default="${default:-1}"
+                ;;
+            CBOB_DEST_REGION)
+                default="${default:-us-east-1}"
+                ;;
+        esac
+
+        # Special handling for sensitive values
+        if [[ "$key" =~ (API_KEY|TOKEN|SECRET) ]]; then
+            read -s -p "$prompt: " value
+            echo
+        else
+            read -p "$prompt [$default]: " value
+            value="${value:-$default}"
+        fi
+
+        # Validate and save
+        if [ -n "$value" ]; then
+            if validate_value "$key" "$value"; then
+                echo "${key}=${value}" >> "$config_file"
+            else
+                warning "Invalid value for $key, skipping"
+            fi
+        elif [ "$requirement" = "required" ]; then
+            error "Required value missing: $key"
+        elif [ "$requirement" = "conditional" ]; then
+            # Check if this conditional is required
+            if [ "$dest_type" = "s3" ] && [[ "$key" =~ ^CBOB_DEST_(ENDPOINT|BUCKET|ACCESS_KEY|SECRET_KEY)$ ]]; then
+                error "Required value missing for S3 destination: $key"
+            elif [ "$dest_type" = "local" ] && [ "$key" = "CBOB_TARGET_PATH" ]; then
+                error "Required value missing for local destination: $key"
+            fi
+        fi
+    done
+    
+    info "Configuration saved to: $config_file"
+    echo
+    validate_config_cmd
+}
+
+# Main function
+main() {
+    local subcommand="${1:-help}"
+    shift || true
+    
+    case "$subcommand" in
+        validate)
+            validate_config_cmd
+            ;;
+        show)
+            local format="text"
+            local unmask="false"
+            
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --format)
+                        format="$2"
+                        shift 2
+                        ;;
+                    --unmask)
+                        unmask="true"
+                        shift
+                        ;;
+                    *)
+                        error "Unknown option: $1"
+                        ;;
+                esac
+            done
+            
+            show_config "$format" "$unmask"
+            ;;
+        get)
+            if [ $# -eq 0 ]; then
+                error "Key required for get command"
+            fi
+            get_config "$1"
+            ;;
+        set)
+            if [ $# -lt 2 ]; then
+                error "Key and value required for set command"
+            fi
+            set_config "$1" "$2"
+            ;;
+        init)
+            init_config
+            ;;
+        help|--help|-h)
+            show_help
+            ;;
+        *)
+            error "Unknown subcommand: $subcommand"
+            ;;
+    esac
+}
+
+# Run main function
+main "$@"

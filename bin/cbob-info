@@ -1,0 +1,181 @@
+#!/bin/bash
+
+# CBOB Info - Show information about all stanzas
+# Display backup information using pgBackRest
+
+set -euo pipefail
+
+# Source common functions
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -f "${SCRIPT_DIR}/../lib/cbob_common.sh" ]; then
+    source "${SCRIPT_DIR}/../lib/cbob_common.sh"
+else
+    source "/usr/local/lib/cbob/cbob_common.sh"
+fi
+
+# Help text
+show_help() {
+    cat << EOF
+Usage: cbob info [options]
+
+Show information about all backup stanzas.
+
+Options:
+    --stanza NAME   Show info for specific stanza only
+    --format FORMAT Output format (text, json)
+    --detailed      Show detailed backup information
+    --help, -h      Show this help message
+
+Examples:
+    cbob info                      # Show info for all stanzas
+    cbob info --stanza abc123      # Show info for specific stanza
+    cbob info --format json        # Output in JSON format
+    cbob info --detailed           # Show detailed backup info
+
+EOF
+}
+
+# Get stanza info
+get_stanza_info() {
+    local stanza="$1"
+    local detailed="${2:-false}"
+    
+    if ! command -v pgbackrest &> /dev/null; then
+        error "pgBackRest is not installed"
+    fi
+    
+    local cmd="pgbackrest --stanza=$stanza --log-level-console=error info"
+    if [ "$detailed" = true ]; then
+        cmd="$cmd --set=latest"
+    fi
+    
+    if $cmd 2>/dev/null; then
+        return 0
+    else
+        warning "Failed to get info for stanza: $stanza"
+        return 1
+    fi
+}
+
+# Get all stanzas
+get_all_stanzas() {
+    load_config
+    validate_config "CBOB_CRUNCHY_CLUSTERS" "CBOB_CRUNCHY_API_KEY"
+    
+    local stanzas=()
+    IFS=',' read -ra clusters <<< "$CBOB_CRUNCHY_CLUSTERS"
+    
+    for cluster_id in "${clusters[@]}"; do
+        # Get stanza name from API
+        local credentials=$(curl -s -X POST \
+            "https://api.crunchybridge.com/clusters/$cluster_id/backup-tokens" \
+            -H "Authorization: Bearer $CBOB_CRUNCHY_API_KEY" 2>/dev/null || echo "{}")
+        
+        local stanza=$(echo "$credentials" | jq -r '.stanza // empty')
+        if [ -n "$stanza" ]; then
+            stanzas+=("$stanza")
+        fi
+    done
+    
+    echo "${stanzas[@]}"
+}
+
+# Format info as JSON
+format_json() {
+    local stanza="$1"
+    
+    # Get raw info output
+    local info_output=$(pgbackrest --stanza=$stanza --output=json info 2>/dev/null || echo '[]')
+    
+    # Parse and format
+    echo "$info_output" | jq -r '.[0] // {}'
+}
+
+# Main function
+main() {
+    local target_stanza=""
+    local format="text"
+    local detailed=false
+    
+    # Parse options
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --stanza)
+                target_stanza="$2"
+                shift 2
+                ;;
+            --format)
+                format="$2"
+                shift 2
+                ;;
+            --detailed)
+                detailed=true
+                shift
+                ;;
+            --help|-h)
+                show_help
+                exit 0
+                ;;
+            *)
+                error "Unknown option: $1"
+                ;;
+        esac
+    done
+    
+    # Check dependencies
+    check_dependencies "pgbackrest" "jq"
+    
+    # Get stanzas to show
+    local stanzas=()
+    if [ -n "$target_stanza" ]; then
+        stanzas=("$target_stanza")
+    else
+        stanzas=($(get_all_stanzas))
+    fi
+    
+    if [ ${#stanzas[@]} -eq 0 ]; then
+        error "No stanzas found"
+    fi
+    
+    info "Backup Information"
+    echo "=================="
+    echo
+    
+    # Show info for each stanza
+    for stanza in "${stanzas[@]}"; do
+        case "$format" in
+            text)
+                echo "Stanza: $stanza"
+                echo "-------------------"
+                get_stanza_info "$stanza" "$detailed"
+                echo
+                ;;
+                
+            json)
+                if [ ${#stanzas[@]} -eq 1 ]; then
+                    format_json "$stanza"
+                else
+                    # Multiple stanzas, create array
+                    echo "{"
+                    local first=true
+                    for s in "${stanzas[@]}"; do
+                        if [ "$first" = true ]; then
+                            first=false
+                        else
+                            echo ","
+                        fi
+                        echo "  \"$s\": $(format_json "$s")"
+                    done
+                    echo "}"
+                fi
+                ;;
+                
+            *)
+                error "Unknown format: $format"
+                ;;
+        esac
+    done
+}
+
+# Run main function
+main "$@"

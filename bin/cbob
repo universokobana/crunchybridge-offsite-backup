@@ -1,0 +1,164 @@
+#!/bin/bash
+
+# Crunchy Bridge Off-site Backup (CBOB) CLI
+# Main entry point for all CBOB operations
+
+set -euo pipefail
+
+# Get the directory where this script is located
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CBOB_ROOT="$(dirname "$SCRIPT_DIR")"
+
+# Source common functions
+if [ -f "${SCRIPT_DIR}/../lib/cbob_common.sh" ]; then
+    source "${SCRIPT_DIR}/../lib/cbob_common.sh"
+elif [ -f "/usr/local/lib/cbob/cbob_common.sh" ]; then
+    source "/usr/local/lib/cbob/cbob_common.sh"
+else
+    echo "ERROR: Cannot find cbob_common.sh library" >&2
+    exit 1
+fi
+
+# Global variables
+readonly CBOB_COMMAND="$(basename "$0")"
+
+# Help text
+show_help() {
+    cat << EOF
+Crunchy Bridge Off-site Backup (CBOB) v${CBOB_VERSION}
+
+Usage: $CBOB_COMMAND <command> [options]
+
+Commands:
+    sync                 Sync backups from Crunchy Bridge to local storage
+    restore-check        Check integrity of all backups using pgbackrest_auto
+    cache-cleanup        Clean repository cache after successful restore-check
+    info                 Show information about all stanzas
+    expire               Expire old backups based on retention policy
+    postgres             Manage local PostgreSQL instances
+    replicate            Multi-region replication management
+    config               Configuration management
+    version              Show version information
+    help                 Show this help message
+
+Options:
+    --dry-run           Run in dry-run mode (no changes made)
+    --config FILE       Use specific configuration file
+    --log-level LEVEL   Set log level (debug, info, warning, error)
+    --log-format FORMAT Set log format (text, json)
+    --no-lock          Skip lock file creation
+    --help, -h         Show help for a specific command
+
+Examples:
+    $CBOB_COMMAND sync                    # Sync all configured clusters
+    $CBOB_COMMAND sync --dry-run          # Test sync without making changes
+    $CBOB_COMMAND postgres start          # Start all PostgreSQL instances
+    $CBOB_COMMAND config validate         # Validate configuration
+    $CBOB_COMMAND restore-check           # Check all backup integrity
+
+For more information on a specific command, use:
+    $CBOB_COMMAND <command> --help
+
+EOF
+}
+
+# Version information
+show_version() {
+    echo "Crunchy Bridge Off-site Backup (CBOB) v${CBOB_VERSION}"
+    echo "Copyright (c) 2023-2024 KOBANA INSTITUICAO DE PAGAMENTO LTDA"
+}
+
+# Parse global options
+parse_global_options() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --dry-run)
+                export CBOB_DRY_RUN="true"
+                shift
+                ;;
+            --config)
+                export CBOB_CONFIG_FILE="$2"
+                shift 2
+                ;;
+            --log-level)
+                export CBOB_LOG_LEVEL="$2"
+                shift 2
+                ;;
+            --log-format)
+                export CBOB_LOG_FORMAT="$2"
+                shift 2
+                ;;
+            --no-lock)
+                export CBOB_NO_LOCK="true"
+                shift
+                ;;
+            --help|-h)
+                show_help
+                exit 0
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+    
+    # Return remaining arguments
+    echo "$@"
+}
+
+# Main entry point
+main() {
+    # Parse global options first
+    local remaining_args=$(parse_global_options "$@")
+    set -- $remaining_args
+    
+    # Check if any command was provided
+    if [ $# -eq 0 ]; then
+        show_help
+        exit 1
+    fi
+    
+    # Get the command
+    local command="$1"
+    shift
+    
+    # Route to appropriate subcommand
+    case "$command" in
+        sync)
+            exec "${SCRIPT_DIR}/cbob-sync" "$@"
+            ;;
+        restore-check|check)
+            exec "${SCRIPT_DIR}/cbob-restore-check" "$@"
+            ;;
+        cache-cleanup)
+            exec "${SCRIPT_DIR}/cbob-cache-cleanup" "$@"
+            ;;
+        info)
+            exec "${SCRIPT_DIR}/cbob-info" "$@"
+            ;;
+        expire)
+            exec "${SCRIPT_DIR}/cbob-expire" "$@"
+            ;;
+        postgres|pg)
+            exec "${SCRIPT_DIR}/cbob-postgres" "$@"
+            ;;
+        replicate|repl)
+            exec "${SCRIPT_DIR}/cbob-replicate" "$@"
+            ;;
+        config)
+            exec "${SCRIPT_DIR}/cbob-config" "$@"
+            ;;
+        version|--version|-v)
+            show_version
+            ;;
+        help|--help|-h)
+            show_help
+            ;;
+        *)
+            error "Unknown command: $command. Use '$CBOB_COMMAND help' for available commands."
+            ;;
+    esac
+}
+
+# Run main function
+main "$@"
