@@ -472,6 +472,7 @@ upload_files_to_s3() {
 
 # Sync from source S3 to destination (local or S3)
 # Usage: sync_to_dest source_s3_url dest_subpath [additional_aws_args...]
+# Uses directory-based batching for efficiency while limiting disk usage
 sync_to_dest() {
     local source_url="$1"
     local dest_subpath="$2"
@@ -481,33 +482,113 @@ sync_to_dest() {
     local dest_path=$(get_dest_path "$dest_subpath")
 
     if is_dest_s3; then
-        debug "Syncing to S3 destination: $source_url -> $dest_path"
+        debug "Syncing to S3 destination (dir-batched): $source_url -> $dest_path"
 
-        # For S3-to-S3 sync, we need to:
-        # 1. Download from source with source credentials
-        # 2. Upload to destination with destination credentials
-        # AWS CLI doesn't support cross-account S3-to-S3 with different credentials directly
-        # So we use a streaming approach with pipes
+        # For S3-to-S3 sync, we batch by subdirectory to:
+        # 1. Use efficient aws s3 sync (parallel downloads)
+        # 2. Limit temp disk usage per batch
+        # 3. Clean temp after each directory
 
-        # Create a temporary directory for the sync
         local temp_dir=$(mktemp -d)
-        trap "rm -rf $temp_dir" RETURN
+        local dir_list=$(mktemp)
+        trap "rm -rf $temp_dir $dir_list" RETURN
 
-        # Download from source
-        debug "Downloading from source S3..."
-        aws_source_cmd s3 sync "$source_url" "$temp_dir" "${additional_args[@]}" || {
-            warning "Failed to download from source: $source_url"
-            return 1
-        }
+        # First, sync root files (archive.info, etc.)
+        info "Syncing root files..."
+        aws_source_cmd s3 sync "$source_url" "$temp_dir" --exclude "*/*" "${additional_args[@]}" 2>/dev/null || true
 
-        # Upload to destination file by file
-        # Using individual uploads because AWS CLI v2 cp --recursive doesn't
-        # properly apply AWS_S3_REQUEST_CHECKSUM_CALCULATION to its parallel workers
-        debug "Uploading to destination S3..."
-        upload_files_to_s3 "$temp_dir" "$dest_path" || {
-            warning "Failed to upload to destination: $dest_path"
-            return 1
-        }
+        if [ "$(find "$temp_dir" -maxdepth 1 -type f | wc -l)" -gt 0 ]; then
+            upload_files_to_s3 "$temp_dir" "$dest_path" || true
+            rm -rf "$temp_dir"/*
+        fi
+
+        # List subdirectories (e.g., 18-1/)
+        info "Listing subdirectories..."
+        aws_source_cmd s3 ls "$source_url/" 2>/dev/null | grep "PRE " | awk '{print $2}' | sed 's/\/$//' > "$dir_list"
+
+        local total_dirs=$(wc -l < "$dir_list" | tr -d ' ')
+        if [ "$total_dirs" -eq 0 ]; then
+            info "No subdirectories to sync"
+            return 0
+        fi
+
+        info "Found $total_dirs top-level directories"
+        local dir_num=0
+
+        while IFS= read -r subdir; do
+            [ -z "$subdir" ] && continue
+            dir_num=$((dir_num + 1))
+
+            # For each top-level dir (e.g., 18-1), list its subdirs
+            local subdir_list=$(mktemp)
+            aws_source_cmd s3 ls "${source_url}/${subdir}/" 2>/dev/null | grep "PRE " | awk '{print $2}' | sed 's/\/$//' > "$subdir_list"
+
+            local subdir_count=$(wc -l < "$subdir_list" | tr -d ' ')
+
+            if [ "$subdir_count" -gt 0 ]; then
+                # Has subdirectories - sync each WAL directory separately
+                info "Processing $subdir/ ($subdir_count subdirs)..."
+                local sub_num=0
+
+                while IFS= read -r waldir; do
+                    [ -z "$waldir" ] && continue
+                    sub_num=$((sub_num + 1))
+
+                    local full_source="${source_url}/${subdir}/${waldir}/"
+                    local full_dest="${dest_path}/${subdir}/${waldir}/"
+
+                    debug "  Syncing ${subdir}/${waldir}/ ($sub_num/$subdir_count)..."
+
+                    # Download this WAL directory
+                    mkdir -p "$temp_dir/${subdir}/${waldir}"
+                    aws_source_cmd s3 sync "$full_source" "$temp_dir/${subdir}/${waldir}/" "${additional_args[@]}" || {
+                        warning "Failed to download: ${subdir}/${waldir}"
+                        continue
+                    }
+
+                    # Upload to destination using sync (incremental - skips existing files)
+                    if [ "$(find "$temp_dir/${subdir}/${waldir}" -type f 2>/dev/null | wc -l)" -gt 0 ]; then
+                        local file_count=$(find "$temp_dir/${subdir}/${waldir}" -type f | wc -l)
+                        debug "  Uploading $file_count files (incremental)..."
+
+                        aws_dest_cmd s3 sync "$temp_dir/${subdir}/${waldir}/" "${dest_path}/${subdir}/${waldir}/" --quiet 2>/dev/null || {
+                            warning "Failed to sync upload: ${subdir}/${waldir}"
+                        }
+                    fi
+
+                    # Clean this subdir
+                    rm -rf "$temp_dir/${subdir}/${waldir}"
+
+                    # Progress every 10 subdirs
+                    if [ $((sub_num % 10)) -eq 0 ]; then
+                        info "  Progress: $sub_num / $subdir_count subdirs in ${subdir}/"
+                    fi
+                done < "$subdir_list"
+
+                info "  Completed ${subdir}/ ($subdir_count subdirs)"
+            else
+                # No subdirectories - sync entire dir at once
+                info "Syncing $subdir/ (flat directory)..."
+                mkdir -p "$temp_dir/${subdir}"
+                aws_source_cmd s3 sync "${source_url}/${subdir}/" "$temp_dir/${subdir}/" "${additional_args[@]}" || {
+                    warning "Failed to download: ${subdir}"
+                    rm -f "$subdir_list"
+                    continue
+                }
+
+                # Upload using sync (incremental - skips existing files)
+                if [ "$(find "$temp_dir/${subdir}" -type f 2>/dev/null | wc -l)" -gt 0 ]; then
+                    aws_dest_cmd s3 sync "$temp_dir/${subdir}/" "${dest_path}/${subdir}/" --quiet 2>/dev/null || true
+                fi
+
+                rm -rf "$temp_dir/${subdir}"
+            fi
+
+            rm -f "$subdir_list"
+            info "Directory progress: $dir_num / $total_dirs"
+        done < "$dir_list"
+
+        info "Successfully synced all directories"
     else
         debug "Syncing to local destination: $source_url -> $dest_path"
 
