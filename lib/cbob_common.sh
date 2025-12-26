@@ -482,113 +482,103 @@ sync_to_dest() {
     local dest_path=$(get_dest_path "$dest_subpath")
 
     if is_dest_s3; then
-        debug "Syncing to S3 destination (dir-batched): $source_url -> $dest_path"
+        debug "Syncing to S3 destination: $source_url -> $dest_path"
 
-        # For S3-to-S3 sync, we batch by subdirectory to:
-        # 1. Use efficient aws s3 sync (parallel downloads)
-        # 2. Limit temp disk usage per batch
-        # 3. Clean temp after each directory
+        # For S3-to-S3 sync, we use DO Spaces as reference:
+        # 1. List files in destination (DO Spaces)
+        # 2. List files in source (Crunchy)
+        # 3. Calculate diff (files in source not in destination)
+        # 4. Download only diff to temp cache
+        # 5. Upload to destination
+        # 6. Clean cache
+        # This minimizes bandwidth and disk usage
 
-        local temp_dir=$(mktemp -d)
-        local dir_list=$(mktemp)
-        trap "rm -rf $temp_dir $dir_list" RETURN
+        local cache_dir="${CBOB_TARGET_PATH}${dest_subpath}"
+        local source_list=$(mktemp)
+        local dest_list=$(mktemp)
+        local diff_list=$(mktemp)
+        trap "rm -f $source_list $dest_list $diff_list" RETURN
 
-        # First, sync root files (archive.info, etc.)
-        info "Syncing root files..."
-        aws_source_cmd s3 sync "$source_url" "$temp_dir" --exclude "*/*" "${additional_args[@]}" 2>/dev/null || true
+        # Extract the bucket and prefix from source URL to strip from listing
+        # source_url format: s3://bucket/path/to/prefix
+        local source_bucket=$(echo "$source_url" | sed 's|s3://||' | cut -d'/' -f1)
+        local source_prefix=$(echo "$source_url" | sed "s|s3://${source_bucket}/||" | sed 's|/*$||')
 
-        if [ "$(find "$temp_dir" -maxdepth 1 -type f | wc -l)" -gt 0 ]; then
-            upload_files_to_s3 "$temp_dir" "$dest_path" || true
-            rm -rf "$temp_dir"/*
-        fi
+        # Extract destination prefix similarly
+        # dest_path format: s3://bucket/prefix
+        local dest_bucket=$(echo "$dest_path" | sed 's|s3://||' | cut -d'/' -f1)
+        local dest_prefix=$(echo "$dest_path" | sed "s|s3://${dest_bucket}/||" | sed 's|/*$||')
 
-        # List subdirectories (e.g., 18-1/)
-        info "Listing subdirectories..."
-        aws_source_cmd s3 ls "$source_url/" 2>/dev/null | grep "PRE " | awk '{print $2}' | sed 's/\/$//' > "$dir_list"
+        # List files in destination (DO Spaces) - extract relative paths
+        debug "Listing destination files (prefix: $dest_prefix)..."
+        aws_dest_cmd s3 ls "$dest_path/" --recursive 2>/dev/null | awk '{print $NF}' | \
+            sed "s|^${dest_prefix}/||" | sort > "$dest_list" || true
 
-        local total_dirs=$(wc -l < "$dir_list" | tr -d ' ')
-        if [ "$total_dirs" -eq 0 ]; then
-            info "No subdirectories to sync"
+        # List files in source (Crunchy) - extract relative paths
+        debug "Listing source files (prefix: $source_prefix)..."
+        aws_source_cmd s3 ls "$source_url/" --recursive 2>/dev/null | awk '{print $NF}' | \
+            sed "s|^${source_prefix}/||" | sort > "$source_list" || {
+            warning "Failed to list source: $source_url"
+            return 1
+        }
+
+        # Calculate diff (files in source but not in destination)
+        comm -23 "$source_list" "$dest_list" > "$diff_list"
+        local diff_count=$(wc -l < "$diff_list" | tr -d ' ')
+
+        if [ "$diff_count" -eq 0 ]; then
+            info "No new files to sync for: $dest_subpath"
             return 0
         fi
 
-        info "Found $total_dirs top-level directories"
-        local dir_num=0
+        info "Found $diff_count new files to sync"
 
-        while IFS= read -r subdir; do
-            [ -z "$subdir" ] && continue
-            dir_num=$((dir_num + 1))
+        # Process files in batches to avoid filling disk
+        local batch_size=200
+        mkdir -p "$cache_dir"
+        local downloaded=0
+        local batch_count=0
 
-            # For each top-level dir (e.g., 18-1), list its subdirs
-            local subdir_list=$(mktemp)
-            aws_source_cmd s3 ls "${source_url}/${subdir}/" 2>/dev/null | grep "PRE " | awk '{print $2}' | sed 's/\/$//' > "$subdir_list"
+        while IFS= read -r file; do
+            [ -z "$file" ] && continue
+            local file_path="${source_url%/}/${file}"
+            local local_path="${cache_dir}/${file}"
+            mkdir -p "$(dirname "$local_path")"
 
-            local subdir_count=$(wc -l < "$subdir_list" | tr -d ' ')
+            aws_source_cmd s3 cp "$file_path" "$local_path" --quiet 2>/dev/null && ((downloaded++)) || true
+            ((batch_count++))
 
-            if [ "$subdir_count" -gt 0 ]; then
-                # Has subdirectories - sync each WAL directory separately
-                info "Processing $subdir/ ($subdir_count subdirs)..."
-                local sub_num=0
-
-                while IFS= read -r waldir; do
-                    [ -z "$waldir" ] && continue
-                    sub_num=$((sub_num + 1))
-
-                    local full_source="${source_url}/${subdir}/${waldir}/"
-                    local full_dest="${dest_path}/${subdir}/${waldir}/"
-
-                    debug "  Syncing ${subdir}/${waldir}/ ($sub_num/$subdir_count)..."
-
-                    # Download this WAL directory
-                    mkdir -p "$temp_dir/${subdir}/${waldir}"
-                    aws_source_cmd s3 sync "$full_source" "$temp_dir/${subdir}/${waldir}/" "${additional_args[@]}" || {
-                        warning "Failed to download: ${subdir}/${waldir}"
-                        continue
-                    }
-
-                    # Upload to destination using sync (incremental - skips existing files)
-                    if [ "$(find "$temp_dir/${subdir}/${waldir}" -type f 2>/dev/null | wc -l)" -gt 0 ]; then
-                        local file_count=$(find "$temp_dir/${subdir}/${waldir}" -type f | wc -l)
-                        debug "  Uploading $file_count files (incremental)..."
-
-                        aws_dest_cmd s3 sync "$temp_dir/${subdir}/${waldir}/" "${dest_path}/${subdir}/${waldir}/" --quiet 2>/dev/null || {
-                            warning "Failed to sync upload: ${subdir}/${waldir}"
-                        }
-                    fi
-
-                    # Clean this subdir
-                    rm -rf "$temp_dir/${subdir}/${waldir}"
-
-                    # Progress every 10 subdirs
-                    if [ $((sub_num % 10)) -eq 0 ]; then
-                        info "  Progress: $sub_num / $subdir_count subdirs in ${subdir}/"
-                    fi
-                done < "$subdir_list"
-
-                info "  Completed ${subdir}/ ($subdir_count subdirs)"
-            else
-                # No subdirectories - sync entire dir at once
-                info "Syncing $subdir/ (flat directory)..."
-                mkdir -p "$temp_dir/${subdir}"
-                aws_source_cmd s3 sync "${source_url}/${subdir}/" "$temp_dir/${subdir}/" "${additional_args[@]}" || {
-                    warning "Failed to download: ${subdir}"
-                    rm -f "$subdir_list"
-                    continue
-                }
-
-                # Upload using sync (incremental - skips existing files)
-                if [ "$(find "$temp_dir/${subdir}" -type f 2>/dev/null | wc -l)" -gt 0 ]; then
-                    aws_dest_cmd s3 sync "$temp_dir/${subdir}/" "${dest_path}/${subdir}/" --quiet 2>/dev/null || true
-                fi
-
-                rm -rf "$temp_dir/${subdir}"
+            # Progress every 100 files
+            if [ $((downloaded % 100)) -eq 0 ] && [ "$downloaded" -gt 0 ]; then
+                info "  Downloaded $downloaded / $diff_count files..."
             fi
 
-            rm -f "$subdir_list"
-            info "Directory progress: $dir_num / $total_dirs"
-        done < "$dir_list"
+            # Upload batch when reaching batch_size
+            if [ "$batch_count" -ge "$batch_size" ]; then
+                info "  Uploading batch ($batch_count files)..."
+                aws_dest_cmd s3 sync "$cache_dir" "$dest_path" --quiet 2>/dev/null || {
+                    warning "Failed to upload batch to destination: $dest_path"
+                }
+                # Clean cache after batch upload
+                rm -rf "${cache_dir:?}"/*
+                batch_count=0
+            fi
+        done < "$diff_list"
 
-        info "Successfully synced all directories"
+        # Upload remaining files in final batch
+        if [ "$batch_count" -gt 0 ]; then
+            info "  Uploading final batch ($batch_count files)..."
+            aws_dest_cmd s3 sync "$cache_dir" "$dest_path" --quiet 2>/dev/null || {
+                warning "Failed to upload final batch to destination: $dest_path"
+                return 1
+            }
+        fi
+
+        info "Synced $downloaded new files in batches of $batch_size"
+
+        # Clean cache after all uploads
+        debug "Cleaning cache: $cache_dir"
+        rm -rf "$cache_dir"
     else
         debug "Syncing to local destination: $source_url -> $dest_path"
 
@@ -613,19 +603,22 @@ copy_to_dest() {
     if is_dest_s3; then
         debug "Copying to S3 destination: $source_url -> $dest_path"
 
-        # Download to temp file, then upload
-        local temp_file=$(mktemp)
-        trap "rm -f $temp_file" RETURN
+        # Use cache file path for single file copy
+        local cache_file="${CBOB_TARGET_PATH}${dest_subpath}"
+        mkdir -p "$(dirname "$cache_file")"
 
-        aws_source_cmd s3 cp "$source_url" "$temp_file" "${additional_args[@]}" || {
+        aws_source_cmd s3 cp "$source_url" "$cache_file" "${additional_args[@]}" || {
             warning "Failed to download from source: $source_url"
             return 1
         }
 
-        aws_dest_cmd s3 cp "$temp_file" "$dest_path" "${additional_args[@]}" || {
+        aws_dest_cmd s3 cp "$cache_file" "$dest_path" "${additional_args[@]}" || {
             warning "Failed to upload to destination: $dest_path"
             return 1
         }
+
+        # Clean cache file after successful upload
+        rm -f "$cache_file"
     else
         debug "Copying to local destination: $source_url -> $dest_path"
 
