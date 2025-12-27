@@ -37,6 +37,18 @@ Options:
     --status            Show sync status for all clusters and exit
     --help, -h          Show this help message
 
+Cluster Selection:
+    By default, syncs ALL primary clusters (replicas are auto-ignored).
+    Use CBOB_IGNORE_CLUSTERS to exclude specific clusters from sync.
+
+    CBOB_IGNORE_CLUSTERS    - Comma-separated cluster IDs to ignore
+    CBOB_CRUNCHY_CLUSTERS   - (Legacy) Explicit list of clusters to sync
+
+    Priority order:
+        1. --cluster flags (if specified)
+        2. CBOB_CRUNCHY_CLUSTERS (legacy explicit list)
+        3. Auto-discover all primary clusters minus CBOB_IGNORE_CLUSTERS
+
 Destination Configuration:
     Set CBOB_DEST_TYPE=s3 to sync to S3-compatible storage instead of local disk.
     Required variables for S3 destination:
@@ -49,11 +61,13 @@ Destination Configuration:
         CBOB_DEST_PREFIX      - Path prefix in bucket (default: none)
 
 Examples:
-    cbob sync                           # Sync all configured clusters
+    cbob sync                           # Sync all primary clusters (auto-discover)
     cbob sync --cluster abc123          # Sync only cluster abc123
+    cbob sync --status                  # Show sync status for all clusters
     cbob sync --parallel 4              # Sync up to 4 clusters in parallel
-    cbob sync --bandwidth 10MB/s        # Limit bandwidth to 10MB/s
-    cbob sync --estimate-only           # Show backup sizes without syncing
+
+    # Ignore specific clusters:
+    CBOB_IGNORE_CLUSTERS=sandbox123,staging456 cbob sync
 
     # Sync to Digital Ocean Spaces:
     CBOB_DEST_TYPE=s3 \\
@@ -133,8 +147,8 @@ validate_environment() {
     # Load and validate configuration
     load_config
 
-    # Validate base configuration
-    validate_config "CBOB_CRUNCHY_API_KEY" "CBOB_CRUNCHY_CLUSTERS"
+    # Validate base configuration (CBOB_CRUNCHY_CLUSTERS is now optional)
+    validate_config "CBOB_CRUNCHY_API_KEY"
 
     # Validate destination-specific configuration
     if is_dest_s3; then
@@ -146,20 +160,89 @@ validate_environment() {
     fi
 }
 
+# Get all clusters from Crunchy Bridge API
+get_all_clusters() {
+    local api_key="$1"
+
+    debug "Fetching all clusters from Crunchy Bridge API..."
+
+    local response=$(curl -s -f -X GET \
+        "https://api.crunchybridge.com/clusters" \
+        -H "Authorization: Bearer $api_key" \
+        -H "Accept: application/json") || {
+        error "Failed to fetch clusters from Crunchy Bridge API"
+    }
+
+    echo "$response"
+}
+
+# Get all primary (non-replica) clusters, excluding ignored ones
+# Returns space-separated list of cluster IDs
+get_primary_clusters() {
+    local api_key="$1"
+    local ignore_list="${2:-}"  # Comma-separated list of cluster IDs to ignore
+
+    info "Fetching clusters from Crunchy Bridge API..."
+
+    local all_clusters=$(get_all_clusters "$api_key")
+
+    # Extract primary clusters (parent_id is null)
+    local primary_ids=$(echo "$all_clusters" | jq -r '.clusters[] | select(.parent_id == null) | .id')
+
+    # Build ignore array
+    local -a ignore_array=()
+    if [ -n "$ignore_list" ]; then
+        IFS=',' read -ra ignore_array <<< "$ignore_list"
+    fi
+
+    # Filter out ignored clusters and build result
+    local result=()
+    local ignored_count=0
+    local replica_count=0
+
+    for cluster_id in $primary_ids; do
+        local should_ignore=false
+
+        # Check if in ignore list
+        for ignored in "${ignore_array[@]}"; do
+            if [ "$cluster_id" = "$ignored" ]; then
+                should_ignore=true
+                ((ignored_count++))
+                debug "Ignoring cluster (in ignore list): $cluster_id"
+                break
+            fi
+        done
+
+        if [ "$should_ignore" = false ]; then
+            result+=("$cluster_id")
+        fi
+    done
+
+    # Count replicas for info
+    replica_count=$(echo "$all_clusters" | jq '[.clusters[] | select(.parent_id != null)] | length')
+
+    info "Found $(echo "$all_clusters" | jq '.clusters | length') total clusters"
+    info "  - Primary clusters: ${#result[@]}"
+    info "  - Replicas (auto-ignored): $replica_count"
+    info "  - Manually ignored: $ignored_count"
+
+    echo "${result[*]}"
+}
+
 # Get cluster information from Crunchy Bridge API
 get_cluster_info() {
     local cluster_id="$1"
     local api_key="$2"
-    
+
     debug "Fetching cluster information for: $cluster_id"
-    
+
     local response=$(curl -s -f -X GET \
         "https://api.crunchybridge.com/clusters/$cluster_id" \
         -H "Authorization: Bearer $api_key" \
         -H "Accept: application/json") || {
         error "Failed to fetch cluster information for $cluster_id"
     }
-    
+
     echo "$response"
 }
 
@@ -416,19 +499,43 @@ main() {
         load_config
         echo "CBOB Sync Status"
         echo "================"
-        echo "Tracking file: $SYNC_TRACKING_FILE"
         echo ""
-        if [ -f "$SYNC_TRACKING_FILE" ]; then
-            echo "Cluster sync history (oldest first):"
-            jq -r 'to_entries | sort_by(.value.last_sync) | .[] | "  \(.key): \(.value.last_sync_datetime // "never")"' "$SYNC_TRACKING_FILE" 2>/dev/null
+
+        # Fetch cluster info from API
+        echo "Fetching clusters from Crunchy Bridge API..."
+        local all_clusters_json=$(curl -s -f -X GET \
+            "https://api.crunchybridge.com/clusters" \
+            -H "Authorization: Bearer $CBOB_CRUNCHY_API_KEY" \
+            -H "Accept: application/json" 2>/dev/null)
+
+        if [ -n "$all_clusters_json" ]; then
             echo ""
-            echo "Clusters never synced:"
-            IFS=',' read -ra all_clusters <<< "$CBOB_CRUNCHY_CLUSTERS"
-            for cluster in "${all_clusters[@]}"; do
-                if ! jq -e ".[\"$cluster\"]" "$SYNC_TRACKING_FILE" &>/dev/null; then
-                    echo "  $cluster"
-                fi
-            done
+            echo "All Clusters:"
+            echo "$all_clusters_json" | jq -r '.clusters[] | "  \(.id) | \(.name) | \(if .parent_id then "REPLICA" else "PRIMARY" end)"'
+
+            echo ""
+            local total=$(echo "$all_clusters_json" | jq '.clusters | length')
+            local primaries=$(echo "$all_clusters_json" | jq '[.clusters[] | select(.parent_id == null)] | length')
+            local replicas=$(echo "$all_clusters_json" | jq '[.clusters[] | select(.parent_id != null)] | length')
+            echo "Summary: $total total, $primaries primaries, $replicas replicas"
+
+            if [ -n "${CBOB_IGNORE_CLUSTERS:-}" ]; then
+                echo ""
+                echo "Ignored clusters (CBOB_IGNORE_CLUSTERS):"
+                IFS=',' read -ra ignored <<< "$CBOB_IGNORE_CLUSTERS"
+                for id in "${ignored[@]}"; do
+                    local name=$(echo "$all_clusters_json" | jq -r ".clusters[] | select(.id == \"$id\") | .name // \"unknown\"")
+                    echo "  $id ($name)"
+                done
+            fi
+        fi
+
+        echo ""
+        echo "Tracking file: $SYNC_TRACKING_FILE"
+        if [ -f "$SYNC_TRACKING_FILE" ]; then
+            echo ""
+            echo "Last sync times (oldest first):"
+            jq -r 'to_entries | sort_by(.value.last_sync) | .[] | "  \(.key): \(.value.last_sync_datetime // "never")"' "$SYNC_TRACKING_FILE" 2>/dev/null
         else
             echo "No tracking file found. No syncs completed yet."
         fi
@@ -454,11 +561,24 @@ main() {
     # Determine which clusters to sync
     local clusters_to_sync=()
     if [ ${#SYNC_CLUSTERS[@]} -gt 0 ]; then
-        # Use specified clusters
+        # Use specified clusters from command line
         clusters_to_sync=("${SYNC_CLUSTERS[@]}")
-    else
-        # Use all configured clusters
+        info "Using clusters specified via --cluster flag"
+    elif [ -n "${CBOB_CRUNCHY_CLUSTERS:-}" ]; then
+        # Legacy mode: use configured cluster list
         IFS=',' read -ra clusters_to_sync <<< "$CBOB_CRUNCHY_CLUSTERS"
+        info "Using configured cluster list (legacy mode)"
+    else
+        # New mode: fetch all primary clusters, exclude ignored ones
+        info "Auto-discovering clusters (ignoring replicas)..."
+        local primary_clusters
+        primary_clusters=$(get_primary_clusters "$CBOB_CRUNCHY_API_KEY" "${CBOB_IGNORE_CLUSTERS:-}")
+        read -ra clusters_to_sync <<< "$primary_clusters"
+    fi
+
+    if [ ${#clusters_to_sync[@]} -eq 0 ]; then
+        warning "No clusters to sync!"
+        exit 0
     fi
 
     # Sort clusters by last sync time (oldest/never synced first)
