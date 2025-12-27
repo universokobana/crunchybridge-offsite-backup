@@ -310,7 +310,20 @@ main() {
     fi
     
     info "Stanzas to check: ${stanzas[*]}"
-    notify ":mag: CBOB Restore Check starting (${#stanzas[@]} stanzas)"
+
+    # Build notification context
+    local server_name=$(hostname -f 2>/dev/null || hostname)
+    local source_info
+    if is_dest_s3; then
+        source_info="${CBOB_DEST_ENDPOINT} ← ${CBOB_DEST_BUCKET}"
+    else
+        source_info="local: ${CBOB_TARGET_PATH}"
+    fi
+
+    notify ":mag: CBOB Restore Check starting
+• Server: ${server_name}
+• Source: ${source_info}
+• Stanzas: ${#stanzas[@]}"
 
     # Set report directory
     if [ -z "$report_dir" ]; then
@@ -370,7 +383,10 @@ main() {
     fi
     
     info "✓ All restore checks passed!"
-    notify ":white_check_mark: CBOB Restore Check completed! ${#stanzas[@]} stanzas verified successfully."
+    notify ":white_check_mark: CBOB Restore Check completed!
+• Server: ${server_name}
+• Source: ${source_info}
+• Stanzas: ${#stanzas[@]} verified successfully"
 }
 
 # Run main function

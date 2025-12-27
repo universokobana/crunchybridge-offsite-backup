@@ -591,7 +591,20 @@ main() {
     show_sync_status
 
     info "Clusters to sync (priority order): ${clusters_to_sync[*]}"
-    notify ":arrows_counterclockwise: CBOB Sync starting (${#clusters_to_sync[@]} clusters)"
+
+    # Build notification context
+    local server_name=$(hostname -f 2>/dev/null || hostname)
+    local dest_info
+    if is_dest_s3; then
+        dest_info="${CBOB_DEST_ENDPOINT} → ${CBOB_DEST_BUCKET}"
+    else
+        dest_info="local: ${CBOB_TARGET_PATH}"
+    fi
+
+    notify ":arrows_counterclockwise: CBOB Sync starting
+• Server: ${server_name}
+• Destination: ${dest_info}
+• Clusters: ${#clusters_to_sync[@]}"
     
     # Sync clusters
     local failed_clusters=()
@@ -643,7 +656,10 @@ main() {
     fi
     
     info "✓ All backups synced successfully!"
-    notify ":white_check_mark: CBOB Sync completed! ${#clusters_to_sync[@]} clusters synced successfully."
+    notify ":white_check_mark: CBOB Sync completed!
+• Server: ${server_name}
+• Destination: ${dest_info}
+• Clusters: ${#clusters_to_sync[@]} synced successfully"
 }
 
 # Run main function
