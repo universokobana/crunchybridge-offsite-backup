@@ -34,6 +34,7 @@ Options:
     --retry-delay N     Initial retry delay in seconds (default: 5)
     --skip-validation   Skip post-sync validation
     --estimate-only     Show estimated backup sizes without syncing
+    --status            Show sync status for all clusters and exit
     --help, -h          Show this help message
 
 Destination Configuration:
@@ -72,6 +73,7 @@ parse_options() {
     SYNC_RETRY_DELAY=5
     SYNC_SKIP_VALIDATION=false
     SYNC_ESTIMATE_ONLY=false
+    SYNC_STATUS_ONLY=false
     
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -101,6 +103,10 @@ parse_options() {
                 ;;
             --estimate-only)
                 SYNC_ESTIMATE_ONLY=true
+                shift
+                ;;
+            --status)
+                SYNC_STATUS_ONLY=true
                 shift
                 ;;
             --help|-h)
@@ -195,13 +201,76 @@ estimate_backup_size() {
     echo "$total_size"
 }
 
+# Tracking file for cluster sync status
+SYNC_TRACKING_FILE="${CBOB_BASE_PATH:-/var/lib/cbob}/sync_tracking.json"
+
+# Get last sync timestamp for a cluster (returns 0 if never synced)
+get_last_sync_time() {
+    local cluster_id="$1"
+    if [ -f "$SYNC_TRACKING_FILE" ]; then
+        jq -r ".[\"$cluster_id\"].last_sync // 0" "$SYNC_TRACKING_FILE" 2>/dev/null || echo "0"
+    else
+        echo "0"
+    fi
+}
+
+# Update tracking after successful sync
+update_sync_tracking() {
+    local cluster_id="$1"
+    local timestamp=$(date +%s)
+    local datetime=$(date -Iseconds)
+
+    # Create tracking file if it doesn't exist
+    if [ ! -f "$SYNC_TRACKING_FILE" ]; then
+        echo "{}" > "$SYNC_TRACKING_FILE"
+    fi
+
+    # Update the tracking for this cluster
+    local tmp_file=$(mktemp)
+    jq --arg id "$cluster_id" \
+       --argjson ts "$timestamp" \
+       --arg dt "$datetime" \
+       '.[$id] = {"last_sync": $ts, "last_sync_datetime": $dt}' \
+       "$SYNC_TRACKING_FILE" > "$tmp_file" && mv "$tmp_file" "$SYNC_TRACKING_FILE"
+
+    debug "Updated sync tracking for cluster $cluster_id"
+}
+
+# Sort clusters by last sync time (oldest first)
+sort_clusters_by_priority() {
+    local clusters=("$@")
+    local sorted=()
+
+    # Create array with cluster:timestamp pairs
+    local pairs=()
+    for cluster_id in "${clusters[@]}"; do
+        local last_sync=$(get_last_sync_time "$cluster_id")
+        pairs+=("$last_sync:$cluster_id")
+    done
+
+    # Sort by timestamp (oldest first) and extract cluster IDs
+    while IFS=: read -r ts cluster_id; do
+        sorted+=("$cluster_id")
+    done < <(printf '%s\n' "${pairs[@]}" | sort -t: -k1 -n)
+
+    echo "${sorted[@]}"
+}
+
+# Show sync tracking status
+show_sync_status() {
+    if [ -f "$SYNC_TRACKING_FILE" ]; then
+        info "Cluster sync status (oldest first):"
+        jq -r 'to_entries | sort_by(.value.last_sync) | .[] | "  \(.key): \(.value.last_sync_datetime // "never")"' "$SYNC_TRACKING_FILE" 2>/dev/null || true
+    fi
+}
+
 # Sync a single cluster
 sync_cluster() {
     local cluster_id="$1"
     local start_time=$(start_timing)
     local bytes_before=0
     local bytes_after=0
-    
+
     info "Starting sync for cluster: $cluster_id"
     
     # Record initial storage metrics
@@ -331,19 +400,46 @@ sync_cluster() {
     
     # Record sync metrics
     record_sync_metrics "$cluster_id" "$start_time" "$end_time" "success" "$bytes_synced"
-    
+
+    # Update tracking file
+    update_sync_tracking "$cluster_id"
+
     info "✓ Sync completed for cluster $cluster_id (duration: ${duration}s, synced: $(human_readable_size $bytes_synced))"
 }
 
 # Main sync function
 main() {
     parse_options "$@"
-    
+
+    # Handle --status flag early (before lock and validation)
+    if [ "$SYNC_STATUS_ONLY" = true ]; then
+        load_config
+        echo "CBOB Sync Status"
+        echo "================"
+        echo "Tracking file: $SYNC_TRACKING_FILE"
+        echo ""
+        if [ -f "$SYNC_TRACKING_FILE" ]; then
+            echo "Cluster sync history (oldest first):"
+            jq -r 'to_entries | sort_by(.value.last_sync) | .[] | "  \(.key): \(.value.last_sync_datetime // "never")"' "$SYNC_TRACKING_FILE" 2>/dev/null
+            echo ""
+            echo "Clusters never synced:"
+            IFS=',' read -ra all_clusters <<< "$CBOB_CRUNCHY_CLUSTERS"
+            for cluster in "${all_clusters[@]}"; do
+                if ! jq -e ".[\"$cluster\"]" "$SYNC_TRACKING_FILE" &>/dev/null; then
+                    echo "  $cluster"
+                fi
+            done
+        else
+            echo "No tracking file found. No syncs completed yet."
+        fi
+        exit 0
+    fi
+
     # Acquire lock unless disabled
     if [ "${CBOB_NO_LOCK:-false}" != "true" ]; then
         acquire_lock "cbob_sync"
     fi
-    
+
     # Validate environment
     validate_environment
     
@@ -365,7 +461,16 @@ main() {
         IFS=',' read -ra clusters_to_sync <<< "$CBOB_CRUNCHY_CLUSTERS"
     fi
 
-    info "Clusters to sync: ${clusters_to_sync[*]}"
+    # Sort clusters by last sync time (oldest/never synced first)
+    info "Sorting clusters by priority (oldest first)..."
+    local sorted_clusters
+    sorted_clusters=$(sort_clusters_by_priority "${clusters_to_sync[@]}")
+    read -ra clusters_to_sync <<< "$sorted_clusters"
+
+    # Show current sync status
+    show_sync_status
+
+    info "Clusters to sync (priority order): ${clusters_to_sync[*]}"
     notify ":arrows_counterclockwise: CBOB Sync starting (${#clusters_to_sync[@]} clusters)"
     
     # Sync clusters
