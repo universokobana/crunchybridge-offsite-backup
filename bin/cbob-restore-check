@@ -152,10 +152,32 @@ EOF
 
         # Cleanup temp config
         [ -n "$temp_config" ] && rm -f "$temp_config"
+
+        # Cleanup restore directory and cache after successful check
+        info "Cleaning up restore directory: $restore_dir"
+        rm -rf "$restore_dir"
+
+        if is_dest_s3; then
+            info "Cleaning up cache for stanza: $stanza"
+            rm -rf "${repo_path}/archive/${stanza}"
+            rm -rf "${repo_path}/backup/${stanza}"
+        fi
+
         return 0
     else
         # Cleanup temp config
         [ -n "$temp_config" ] && rm -f "$temp_config"
+
+        # Cleanup restore directory even on failure to free space
+        info "Cleaning up restore directory after failure: $restore_dir"
+        rm -rf "$restore_dir"
+
+        if is_dest_s3; then
+            info "Cleaning up cache for stanza: $stanza"
+            rm -rf "${repo_path}/archive/${stanza}"
+            rm -rf "${repo_path}/backup/${stanza}"
+        fi
+
         error "✗ Backup check failed for stanza: $stanza"
         return 1
     fi
