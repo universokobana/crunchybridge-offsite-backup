@@ -8,6 +8,9 @@ CBOB_VERSION="2.0.0"
 CBOB_LOG_FORMAT="${CBOB_LOG_FORMAT:-text}"  # text or json
 CBOB_LOG_LEVEL="${CBOB_LOG_LEVEL:-info}"    # debug, info, warning, error
 
+# Ensure PATH includes common binary locations (important for cron)
+export PATH="/usr/local/bin:/usr/bin:/bin:/sbin:/usr/sbin:${PATH}"
+
 # AWS CLI v2 compatibility for S3-compatible services (DigitalOcean Spaces, MinIO, etc.)
 # Disables CRC32 checksums that AWS CLI v2 sends by default but some services don't support
 export AWS_S3_REQUEST_CHECKSUM_CALCULATION="${AWS_S3_REQUEST_CHECKSUM_CALCULATION:-when_required}"
