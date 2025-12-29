@@ -475,7 +475,7 @@ upload_files_to_s3() {
 
 # Sync from source S3 to destination (local or S3)
 # Usage: sync_to_dest source_s3_url dest_subpath [additional_aws_args...]
-# Uses directory-based batching for efficiency while limiting disk usage
+# Uses aws s3 sync with --include patterns for parallel downloads (much faster)
 sync_to_dest() {
     local source_url="$1"
     local dest_subpath="$2"
@@ -487,14 +487,13 @@ sync_to_dest() {
     if is_dest_s3; then
         debug "Syncing to S3 destination: $source_url -> $dest_path"
 
-        # For S3-to-S3 sync, we use DO Spaces as reference:
-        # 1. List files in destination (DO Spaces)
-        # 2. List files in source (Crunchy)
-        # 3. Calculate diff (files in source not in destination)
-        # 4. Download only diff to temp cache
-        # 5. Upload to destination
-        # 6. Clean cache
-        # This minimizes bandwidth and disk usage
+        # For S3-to-S3 sync via local cache:
+        # 1. List files in destination and source
+        # 2. Calculate diff (files in source not in destination)
+        # 3. Download diff in batches using aws s3 sync with --include (parallel!)
+        # 4. Upload batch to destination
+        # 5. Clean cache and repeat
+        # This uses AWS CLI's internal parallelism for much faster transfers
 
         local cache_dir="${CBOB_TARGET_PATH}${dest_subpath}"
         local source_list=$(mktemp)
@@ -512,7 +511,7 @@ sync_to_dest() {
         local dest_bucket=$(echo "$dest_path" | sed 's|s3://||' | cut -d'/' -f1)
         local dest_prefix=$(echo "$dest_path" | sed "s|s3://${dest_bucket}/||" | sed 's|/*$||')
 
-        # List files in destination (DO Spaces) - extract relative paths
+        # List files in destination - extract relative paths
         debug "Listing destination files (prefix: $dest_prefix)..."
         aws_dest_cmd s3 ls "$dest_path/" --recursive 2>/dev/null | awk '{print $NF}' | \
             sed "s|^${dest_prefix}/||" | sort > "$dest_list" || true
@@ -536,48 +535,74 @@ sync_to_dest() {
 
         info "Found $diff_count new files to sync"
 
-        # Process files in batches to avoid filling disk
-        local batch_size=200
+        # Process files in batches using aws s3 sync with --include patterns
+        # This leverages AWS CLI's internal parallelism (default 10 concurrent requests)
+        local batch_size="${CBOB_SYNC_BATCH_SIZE:-1000}"
+        local synced=0
+        local batch_num=0
+        local batch_file=$(mktemp)
+        trap "rm -f $source_list $dest_list $diff_list $batch_file" RETURN
+
         mkdir -p "$cache_dir"
-        local downloaded=0
-        local batch_count=0
 
-        while IFS= read -r file; do
+        while IFS= read -r file || [ -n "$file" ]; do
             [ -z "$file" ] && continue
-            local file_path="${source_url%/}/${file}"
-            local local_path="${cache_dir}/${file}"
-            mkdir -p "$(dirname "$local_path")"
+            echo "$file" >> "$batch_file"
+            ((synced++))
 
-            aws_source_cmd s3 cp "$file_path" "$local_path" --quiet 2>/dev/null && ((downloaded++)) || true
-            ((batch_count++))
+            # Process batch when reaching batch_size or end of file
+            if [ $((synced % batch_size)) -eq 0 ]; then
+                ((batch_num++))
+                info "  Downloading batch $batch_num ($batch_size files, $synced / $diff_count total)..."
 
-            # Progress every 100 files
-            if [ $((downloaded % 100)) -eq 0 ] && [ "$downloaded" -gt 0 ]; then
-                info "  Downloaded $downloaded / $diff_count files..."
-            fi
+                # Build --include arguments for aws s3 sync
+                local include_args=("--exclude" "*")
+                while IFS= read -r pattern; do
+                    [ -z "$pattern" ] && continue
+                    include_args+=("--include" "$pattern")
+                done < "$batch_file"
 
-            # Upload batch when reaching batch_size
-            if [ "$batch_count" -ge "$batch_size" ]; then
-                info "  Uploading batch ($batch_count files)..."
-                aws_dest_cmd s3 sync "$cache_dir" "$dest_path" --quiet 2>/dev/null || {
-                    warning "Failed to upload batch to destination: $dest_path"
+                # Download batch using aws s3 sync (parallel transfers!)
+                aws_source_cmd s3 sync "$source_url" "$cache_dir" "${include_args[@]}" 2>/dev/null || {
+                    warning "Failed to download batch $batch_num"
                 }
-                # Clean cache after batch upload
+
+                # Upload batch to destination
+                info "  Uploading batch $batch_num to destination..."
+                aws_dest_cmd s3 sync "$cache_dir" "$dest_path" --quiet 2>/dev/null || {
+                    warning "Failed to upload batch $batch_num to destination: $dest_path"
+                }
+
+                # Clean cache and batch file for next iteration
                 rm -rf "${cache_dir:?}"/*
-                batch_count=0
+                > "$batch_file"
             fi
         done < "$diff_list"
 
-        # Upload remaining files in final batch
-        if [ "$batch_count" -gt 0 ]; then
-            info "  Uploading final batch ($batch_count files)..."
+        # Process remaining files in final batch
+        local remaining=$(wc -l < "$batch_file" | tr -d ' ')
+        if [ "$remaining" -gt 0 ]; then
+            ((batch_num++))
+            info "  Downloading final batch $batch_num ($remaining files)..."
+
+            local include_args=("--exclude" "*")
+            while IFS= read -r pattern; do
+                [ -z "$pattern" ] && continue
+                include_args+=("--include" "$pattern")
+            done < "$batch_file"
+
+            aws_source_cmd s3 sync "$source_url" "$cache_dir" "${include_args[@]}" 2>/dev/null || {
+                warning "Failed to download final batch"
+            }
+
+            info "  Uploading final batch to destination..."
             aws_dest_cmd s3 sync "$cache_dir" "$dest_path" --quiet 2>/dev/null || {
                 warning "Failed to upload final batch to destination: $dest_path"
                 return 1
             }
         fi
 
-        info "Synced $downloaded new files in batches of $batch_size"
+        info "Synced $synced files in $batch_num batches (batch size: $batch_size)"
 
         # Clean cache after all uploads
         debug "Cleaning cache: $cache_dir"

@@ -67,7 +67,7 @@ main() {
     # Load configuration
     load_config
 
-    local log_file="${CBOB_LOG_PATH:-/var/log/cbob}/cron_restore.log"
+    local log_file="${CBOB_LOG_PATH:-/var/lib/cbob/log/cbob}/cron_restore_check.log"
     local cache_dir="${CBOB_REPO_CACHE:-${CBOB_BASE_PATH:-/var/lib/cbob}/repo_cache}"
 
     info "CBOB Cache Cleanup"

@@ -38,26 +38,77 @@ Examples:
 EOF
 }
 
-# Get all stanzas
+# Get all clusters from Crunchy Bridge API (auto-discovery)
+get_all_clusters() {
+    local api_key="$1"
+    curl -s -f -X GET \
+        "https://api.crunchybridge.com/clusters" \
+        -H "Authorization: Bearer $api_key" 2>/dev/null || echo "{}"
+}
+
+# Get all primary (non-replica) clusters
+get_primary_clusters() {
+    local api_key="$1"
+    local ignore_list="${CBOB_IGNORE_CLUSTERS:-}"
+
+    info "Auto-discovering clusters from Crunchy Bridge API..."
+    local all_clusters=$(get_all_clusters "$api_key")
+
+    if [ -z "$all_clusters" ] || [ "$all_clusters" = "{}" ]; then
+        error "Failed to fetch clusters from Crunchy Bridge API"
+        return 1
+    fi
+
+    # Extract primary clusters (parent_id is null)
+    local primary_ids=$(echo "$all_clusters" | jq -r '.clusters[] | select(.parent_id == null) | .id')
+
+    local result=()
+    for cluster_id in $primary_ids; do
+        # Check if cluster should be ignored
+        if [ -n "$ignore_list" ] && echo "$ignore_list" | grep -q "$cluster_id"; then
+            debug "Ignoring cluster: $cluster_id"
+            continue
+        fi
+        result+=("$cluster_id")
+    done
+
+    local total=$(echo "$all_clusters" | jq '.clusters | length')
+    local replica_count=$(echo "$all_clusters" | jq '[.clusters[] | select(.parent_id != null)] | length')
+
+    info "Found $total total clusters"
+    info "  - Primary clusters: ${#result[@]}"
+    info "  - Replicas (auto-ignored): $replica_count"
+
+    echo "${result[@]}"
+}
+
+# Get all stanzas (uses auto-discovery)
 get_all_stanzas() {
     load_config
-    validate_config "CBOB_CRUNCHY_CLUSTERS" "CBOB_CRUNCHY_API_KEY"
-    
+    validate_config "CBOB_CRUNCHY_API_KEY"
+
     local stanzas=()
-    IFS=',' read -ra clusters <<< "$CBOB_CRUNCHY_CLUSTERS"
-    
+
+    # Use auto-discovery to get primary clusters
+    local clusters=($(get_primary_clusters "$CBOB_CRUNCHY_API_KEY"))
+
+    if [ ${#clusters[@]} -eq 0 ]; then
+        error "No clusters found"
+        return 1
+    fi
+
     for cluster_id in "${clusters[@]}"; do
         # Get stanza name from API
         local credentials=$(curl -s -X POST \
             "https://api.crunchybridge.com/clusters/$cluster_id/backup-tokens" \
             -H "Authorization: Bearer $CBOB_CRUNCHY_API_KEY" 2>/dev/null || echo "{}")
-        
+
         local stanza=$(echo "$credentials" | jq -r '.stanza // empty')
         if [ -n "$stanza" ]; then
             stanzas+=("$stanza")
         fi
     done
-    
+
     echo "${stanzas[@]}"
 }
 
