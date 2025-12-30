@@ -146,29 +146,70 @@ notify() {
 }
 
 # Lock file management
+_cleanup_lock() {
+    if [ -n "${CBOB_LOCK_FILE:-}" ]; then
+        rm -f "${CBOB_LOCK_FILE}" 2>/dev/null || true
+        # Close the file descriptor if open
+        exec 9>&- 2>/dev/null || true
+    fi
+}
+
 acquire_lock() {
     local lock_name="${1:-cbob}"
     local lock_file="/tmp/${lock_name}.lock"
-    
+    local max_lock_age="${2:-86400}"  # Default: 24 hours
+
     export CBOB_LOCK_FILE="$lock_file"
-    
-    # Create lock file with exclusive access
-    exec 9>"${lock_file}"
+
+    # Check for stale lock file (older than max_lock_age seconds)
+    if [ -f "$lock_file" ]; then
+        local lock_age
+        lock_age=$(( $(date +%s) - $(stat -c %Y "$lock_file" 2>/dev/null || stat -f %m "$lock_file" 2>/dev/null || echo 0) ))
+
+        if [ "$lock_age" -gt "$max_lock_age" ]; then
+            warning "Removing stale lock file (age: ${lock_age}s, max: ${max_lock_age}s)"
+            rm -f "$lock_file" 2>/dev/null || true
+        fi
+
+        # Check if lock file contains a PID and if that process is still running
+        if [ -f "$lock_file" ]; then
+            local lock_pid
+            lock_pid=$(cat "$lock_file" 2>/dev/null || echo "")
+            if [ -n "$lock_pid" ] && [ "$lock_pid" -gt 0 ] 2>/dev/null; then
+                if ! kill -0 "$lock_pid" 2>/dev/null; then
+                    warning "Removing orphaned lock file (PID $lock_pid is not running)"
+                    rm -f "$lock_file" 2>/dev/null || true
+                fi
+            fi
+        fi
+    fi
+
+    # Try to create/open lock file
+    if ! exec 9>"${lock_file}" 2>/dev/null; then
+        error "Cannot create lock file: $lock_file (permission denied or disk full)"
+    fi
+
+    # Try to acquire exclusive lock
     if ! flock -n 9; then
         error "Another instance is already running (lock file: $lock_file)"
     fi
-    
-    # Set trap to clean up lock file on exit
-    trap 'rm -f "${CBOB_LOCK_FILE}"' EXIT
-    
-    debug "Acquired lock: $lock_file"
+
+    # Write our PID to the lock file for stale detection
+    echo $$ > "$lock_file"
+
+    # Set trap to clean up lock file on exit and common signals
+    trap '_cleanup_lock' EXIT
+    trap '_cleanup_lock; exit 130' INT
+    trap '_cleanup_lock; exit 143' TERM
+    trap '_cleanup_lock; exit 129' HUP
+
+    debug "Acquired lock: $lock_file (PID: $$)"
 }
 
 release_lock() {
-    if [ -n "${CBOB_LOCK_FILE}" ] && [ -f "${CBOB_LOCK_FILE}" ]; then
-        rm -f "${CBOB_LOCK_FILE}"
-        debug "Released lock: ${CBOB_LOCK_FILE}"
-    fi
+    _cleanup_lock
+    debug "Released lock: ${CBOB_LOCK_FILE:-unknown}"
+    unset CBOB_LOCK_FILE
 }
 
 # Configuration loading
@@ -754,7 +795,7 @@ fi
 
 # Export all functions
 export -f log_message debug info warning error notify
-export -f acquire_lock release_lock load_config validate_config
+export -f _cleanup_lock acquire_lock release_lock load_config validate_config
 export -f check_dependencies retry_with_backoff send_heartbeat
 export -f show_progress human_readable_size
 export -f is_dest_s3 validate_dest_s3_config aws_source_cmd aws_dest_cmd get_dest_path
