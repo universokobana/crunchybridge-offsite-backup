@@ -284,14 +284,17 @@ estimate_backup_size() {
     echo "$total_size"
 }
 
-# Tracking file for cluster sync status
-SYNC_TRACKING_FILE="${CBOB_BASE_PATH:-/var/lib/cbob}/sync_tracking.json"
+# Tracking file for cluster sync status (evaluated at runtime after config is loaded)
+get_sync_tracking_file() {
+    echo "${CBOB_BASE_PATH:-/var/lib/cbob}/sync_tracking.json"
+}
 
 # Get last sync timestamp for a cluster (returns 0 if never synced)
 get_last_sync_time() {
     local cluster_id="$1"
-    if [ -f "$SYNC_TRACKING_FILE" ]; then
-        jq -r ".[\"$cluster_id\"].last_sync // 0" "$SYNC_TRACKING_FILE" 2>/dev/null || echo "0"
+    local tracking_file=$(get_sync_tracking_file)
+    if [ -f "$tracking_file" ]; then
+        jq -r ".[\"$cluster_id\"].last_sync // 0" "$tracking_file" 2>/dev/null || echo "0"
     else
         echo "0"
     fi
@@ -300,12 +303,19 @@ get_last_sync_time() {
 # Update tracking after successful sync
 update_sync_tracking() {
     local cluster_id="$1"
+    local tracking_file=$(get_sync_tracking_file)
     local timestamp=$(date +%s)
     local datetime=$(date -Iseconds)
 
+    # Create parent directory if it doesn't exist
+    local tracking_dir=$(dirname "$tracking_file")
+    if [ ! -d "$tracking_dir" ]; then
+        mkdir -p "$tracking_dir"
+    fi
+
     # Create tracking file if it doesn't exist
-    if [ ! -f "$SYNC_TRACKING_FILE" ]; then
-        echo "{}" > "$SYNC_TRACKING_FILE"
+    if [ ! -f "$tracking_file" ]; then
+        echo "{}" > "$tracking_file"
     fi
 
     # Update the tracking for this cluster
@@ -314,7 +324,7 @@ update_sync_tracking() {
        --argjson ts "$timestamp" \
        --arg dt "$datetime" \
        '.[$id] = {"last_sync": $ts, "last_sync_datetime": $dt}' \
-       "$SYNC_TRACKING_FILE" > "$tmp_file" && mv "$tmp_file" "$SYNC_TRACKING_FILE"
+       "$tracking_file" > "$tmp_file" && mv "$tmp_file" "$tracking_file"
 
     debug "Updated sync tracking for cluster $cluster_id"
 }
@@ -341,9 +351,10 @@ sort_clusters_by_priority() {
 
 # Show sync tracking status
 show_sync_status() {
-    if [ -f "$SYNC_TRACKING_FILE" ]; then
+    local tracking_file=$(get_sync_tracking_file)
+    if [ -f "$tracking_file" ]; then
         info "Cluster sync status (oldest first):"
-        jq -r 'to_entries | sort_by(.value.last_sync) | .[] | "  \(.key): \(.value.last_sync_datetime // "never")"' "$SYNC_TRACKING_FILE" 2>/dev/null || true
+        jq -r 'to_entries | sort_by(.value.last_sync) | .[] | "  \(.key): \(.value.last_sync_datetime // "never")"' "$tracking_file" 2>/dev/null || true
     fi
 }
 
@@ -531,11 +542,12 @@ main() {
         fi
 
         echo ""
-        echo "Tracking file: $SYNC_TRACKING_FILE"
-        if [ -f "$SYNC_TRACKING_FILE" ]; then
+        local tracking_file=$(get_sync_tracking_file)
+        echo "Tracking file: $tracking_file"
+        if [ -f "$tracking_file" ]; then
             echo ""
             echo "Last sync times (oldest first):"
-            jq -r 'to_entries | sort_by(.value.last_sync) | .[] | "  \(.key): \(.value.last_sync_datetime // "never")"' "$SYNC_TRACKING_FILE" 2>/dev/null
+            jq -r 'to_entries | sort_by(.value.last_sync) | .[] | "  \(.key): \(.value.last_sync_datetime // "never")"' "$tracking_file" 2>/dev/null
         else
             echo "No tracking file found. No syncs completed yet."
         fi
