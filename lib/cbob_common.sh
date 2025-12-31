@@ -775,7 +775,7 @@ download_from_dest() {
     if is_dest_s3; then
         debug "Downloading from S3 destination: $dest_path -> $local_path"
         mkdir -p "$local_path"
-        aws_dest_cmd s3 sync "$dest_path" "$local_path"
+        aws_dest_cmd s3 sync "$dest_path" "$local_path" >&2
     else
         debug "Copying from local destination: $dest_path -> $local_path"
         if [ "$dest_path" != "$local_path" ]; then
