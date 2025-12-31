@@ -162,6 +162,7 @@ check_stanza() {
     cmd="$cmd --to=$restore_dir"
     cmd="$cmd --clear"
     cmd="$cmd --report"
+    cmd="$cmd --pgver=${CBOB_PG_VERSION:-18}"
 
     if [ "$skip_checkdb" != true ]; then
         cmd="$cmd --checkdb"
