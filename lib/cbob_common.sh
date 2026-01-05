@@ -764,6 +764,65 @@ get_dest_size() {
     fi
 }
 
+# Sync a metadata file (backup.info, archive.info) keeping it both locally and in S3
+# This function treats S3 destination as the source of truth:
+# 1. If file exists in S3 dest → download to local (ensures local is in sync with S3)
+# 2. If file doesn't exist in S3 dest → download from source → save locally → upload to S3
+# Usage: sync_metadata_file source_s3_url dest_subpath [additional_aws_args...]
+sync_metadata_file() {
+    local source_url="$1"
+    local dest_subpath="$2"
+    shift 2
+    local additional_args=("$@")
+
+    local local_file="${CBOB_TARGET_PATH}${dest_subpath}"
+    mkdir -p "$(dirname "$local_file")"
+
+    if is_dest_s3; then
+        local dest_path=$(get_dest_path "$dest_subpath")
+        debug "Syncing metadata file: $dest_subpath"
+
+        # Check if file exists in S3 destination (source of truth)
+        if dest_exists "$dest_subpath"; then
+            debug "File exists in S3 destination, downloading to local: $dest_subpath"
+            # Download from S3 destination to local (S3 dest is source of truth)
+            aws_dest_cmd s3 cp "$dest_path" "$local_file" --quiet 2>/dev/null || {
+                warning "Failed to download from S3 destination: $dest_path"
+                # Fallback: try to get from source
+                debug "Fallback: downloading from source"
+                aws_source_cmd s3 cp "$source_url" "$local_file" "${additional_args[@]}" 2>/dev/null || {
+                    warning "Failed to download from source: $source_url"
+                    return 1
+                }
+                # Re-upload to destination
+                aws_dest_cmd s3 cp "$local_file" "$dest_path" --quiet 2>/dev/null || {
+                    warning "Failed to upload to destination: $dest_path"
+                }
+            }
+        else
+            debug "File not in S3 destination, syncing from source: $source_url"
+            # Download from source (Crunchy Bridge)
+            aws_source_cmd s3 cp "$source_url" "$local_file" "${additional_args[@]}" || {
+                warning "Failed to download from source: $source_url"
+                return 1
+            }
+            # Upload to S3 destination
+            aws_dest_cmd s3 cp "$local_file" "$dest_path" --quiet 2>/dev/null || {
+                warning "Failed to upload to destination: $dest_path"
+                return 1
+            }
+            info "Synced metadata file: $dest_subpath"
+        fi
+
+        # File is kept locally (not deleted!)
+        debug "Metadata file kept locally: $local_file"
+    else
+        # Local destination only - just copy from source
+        debug "Copying metadata to local: $source_url -> $local_file"
+        aws_source_cmd s3 cp "$source_url" "$local_file" "${additional_args[@]}"
+    fi
+}
+
 # Download from destination to local path (for restore operations)
 # Usage: download_from_dest dest_subpath local_path
 download_from_dest() {
@@ -800,4 +859,4 @@ export -f check_dependencies retry_with_backoff send_heartbeat
 export -f show_progress human_readable_size
 export -f is_dest_s3 validate_dest_s3_config aws_source_cmd aws_dest_cmd get_dest_path
 export -f upload_files_to_s3 sync_to_dest copy_to_dest list_dest dest_exists get_dest_size
-export -f download_from_dest
+export -f sync_metadata_file download_from_dest

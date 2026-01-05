@@ -449,16 +449,32 @@ sync_cluster() {
         "/backup/${stanza}/backup.history" \
         "${aws_sync_opts[@]}"
 
+    # Use sync_metadata_file to keep files both locally AND in S3 destination
+    # S3 destination is treated as source of truth
     retry_with_backoff "$SYNC_RETRY_COUNT" "$SYNC_RETRY_DELAY" 60 \
-        copy_to_dest \
+        sync_metadata_file \
         "s3://${bucket}${repo_path}/backup/${stanza}/backup.info" \
         "/backup/${stanza}/backup.info" \
         "${aws_sync_opts[@]}"
 
     retry_with_backoff "$SYNC_RETRY_COUNT" "$SYNC_RETRY_DELAY" 60 \
-        copy_to_dest \
+        sync_metadata_file \
         "s3://${bucket}${repo_path}/backup/${stanza}/backup.info.copy" \
         "/backup/${stanza}/backup.info.copy" \
+        "${aws_sync_opts[@]}"
+
+    # Sync archive metadata (required for pgBackRest to recognize WAL archives)
+    info "Syncing archive metadata"
+    retry_with_backoff "$SYNC_RETRY_COUNT" "$SYNC_RETRY_DELAY" 60 \
+        sync_metadata_file \
+        "s3://${bucket}${repo_path}/archive/${stanza}/archive.info" \
+        "/archive/${stanza}/archive.info" \
+        "${aws_sync_opts[@]}"
+
+    retry_with_backoff "$SYNC_RETRY_COUNT" "$SYNC_RETRY_DELAY" 60 \
+        sync_metadata_file \
+        "s3://${bucket}${repo_path}/archive/${stanza}/archive.info.copy" \
+        "/archive/${stanza}/archive.info.copy" \
         "${aws_sync_opts[@]}"
     
     # Post-sync validation
