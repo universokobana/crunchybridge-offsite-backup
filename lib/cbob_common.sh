@@ -28,6 +28,12 @@ declare -g LOG_LEVEL_INFO=1 2>/dev/null || true
 declare -g LOG_LEVEL_WARNING=2 2>/dev/null || true
 declare -g LOG_LEVEL_ERROR=3 2>/dev/null || true
 
+# Token refresh tracking - STS tokens expire after ~1 hour
+# We refresh proactively at 45 minutes to avoid mid-batch failures
+declare -g _CBOB_TOKEN_FETCH_TIME=0 2>/dev/null || true
+declare -g _CBOB_TOKEN_CLUSTER_ID="" 2>/dev/null || true
+declare -g _CBOB_TOKEN_MAX_AGE_SECONDS=2700 2>/dev/null || true  # 45 minutes
+
 # Get numeric log level
 # Uses tr for lowercase conversion (compatible with bash 3.2+)
 get_log_level_num() {
@@ -128,21 +134,54 @@ error() {
 # Notification function
 notify() {
     local message="$1"
+    local hostname="${HOSTNAME:-$(hostname -s 2>/dev/null || echo 'unknown')}"
 
     # Skip if no Slack token configured
     if [ -z "${CBOB_SLACK_CLI_TOKEN:-}" ]; then
         return 0
     fi
-    
+
     # Check if slack command exists
     if ! command -v slack &> /dev/null; then
         debug "Slack CLI not found, skipping notification"
         return 0
     fi
-    
+
+    # Add hostname prefix for identification
+    local full_message="[$hostname] $message"
+
     # Send notification (ignore errors)
     export SLACK_CLI_TOKEN="${CBOB_SLACK_CLI_TOKEN}"
-    (slack chat send --text "$message" --channel "${CBOB_SLACK_CHANNEL:-#general}" >/dev/null 2>&1) || true
+    (slack chat send --text "$full_message" --channel "${CBOB_SLACK_CHANNEL:-#general}" >/dev/null 2>&1) || true
+}
+
+# Warning aggregation - reduces Slack notification spam
+# Use warn_silent() for warnings that should be aggregated, then flush_warnings() at the end
+declare -g _CBOB_WARNING_COUNT=0 2>/dev/null || true
+declare -g _CBOB_WARNING_CONTEXT="" 2>/dev/null || true
+
+# Silent warning - logs but doesn't notify immediately (use for batch operations)
+warn_silent() {
+    log_message "WARNING" "$1"
+    ((_CBOB_WARNING_COUNT++)) || true
+}
+
+# Start aggregating warnings for a specific context
+start_warning_aggregation() {
+    _CBOB_WARNING_COUNT=0
+    _CBOB_WARNING_CONTEXT="${1:-batch operation}"
+}
+
+# Flush aggregated warnings - sends a single summary notification
+flush_warnings() {
+    local context="${1:-${_CBOB_WARNING_CONTEXT:-batch operation}}"
+
+    if [ "${_CBOB_WARNING_COUNT:-0}" -gt 0 ]; then
+        notify ":warning: $context: $_CBOB_WARNING_COUNT failures occurred (check logs for details)"
+    fi
+
+    _CBOB_WARNING_COUNT=0
+    _CBOB_WARNING_CONTEXT=""
 }
 
 # Lock file management
@@ -416,6 +455,83 @@ validate_dest_s3_config() {
     debug "S3 destination configured: ${CBOB_DEST_ENDPOINT}/${CBOB_DEST_BUCKET}"
 }
 
+# Mark that source credentials were just fetched
+# Call this after setting AWS_SESSION_TOKEN, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+# Usage: mark_source_credentials_fresh cluster_id
+mark_source_credentials_fresh() {
+    local cluster_id="$1"
+    _CBOB_TOKEN_FETCH_TIME=$(date +%s)
+    _CBOB_TOKEN_CLUSTER_ID="$cluster_id"
+    debug "Source credentials marked fresh for cluster: $cluster_id"
+}
+
+# Check if source credentials need refresh (older than 45 minutes)
+# Returns: 0 if refresh needed, 1 if still fresh
+needs_credential_refresh() {
+    local current_time=$(date +%s)
+    local age=$(( current_time - _CBOB_TOKEN_FETCH_TIME ))
+
+    if [ "$age" -ge "$_CBOB_TOKEN_MAX_AGE_SECONDS" ]; then
+        debug "Credentials are ${age}s old (max: ${_CBOB_TOKEN_MAX_AGE_SECONDS}s) - refresh needed"
+        return 0
+    fi
+    return 1
+}
+
+# Refresh source credentials from Crunchy Bridge API
+# This fetches a new STS token for the current cluster
+# Usage: refresh_source_credentials
+refresh_source_credentials() {
+    local cluster_id="${_CBOB_TOKEN_CLUSTER_ID}"
+    local api_key="${CBOB_CRUNCHY_API_KEY:-}"
+
+    if [ -z "$cluster_id" ]; then
+        debug "No cluster ID set, cannot refresh credentials"
+        return 1
+    fi
+
+    if [ -z "$api_key" ]; then
+        debug "No API key available, cannot refresh credentials"
+        return 1
+    fi
+
+    info "Refreshing source credentials for cluster: $cluster_id"
+
+    local response=$(curl -s -f -X POST \
+        "https://api.crunchybridge.com/clusters/$cluster_id/backup-tokens" \
+        -H "Authorization: Bearer $api_key" \
+        -H "Accept: application/json" 2>/dev/null) || {
+        warn_silent "Failed to refresh credentials for cluster $cluster_id"
+        return 1
+    }
+
+    # Extract and export new credentials
+    local new_token=$(echo "$response" | jq -r '.aws.s3_token // empty')
+    local new_key=$(echo "$response" | jq -r '.aws.s3_key // empty')
+    local new_secret=$(echo "$response" | jq -r '.aws.s3_key_secret // empty')
+
+    if [ -z "$new_token" ] || [ -z "$new_key" ] || [ -z "$new_secret" ]; then
+        warn_silent "Invalid credentials response when refreshing for cluster $cluster_id"
+        return 1
+    fi
+
+    export AWS_SESSION_TOKEN="$new_token"
+    export AWS_ACCESS_KEY_ID="$new_key"
+    export AWS_SECRET_ACCESS_KEY="$new_secret"
+
+    mark_source_credentials_fresh "$cluster_id"
+    info "Source credentials refreshed successfully"
+    return 0
+}
+
+# Check and refresh credentials if needed (call before S3 operations)
+# Usage: maybe_refresh_credentials
+maybe_refresh_credentials() {
+    if needs_credential_refresh; then
+        refresh_source_credentials || true
+    fi
+}
+
 # Build AWS CLI command for source (Crunchy Bridge S3 or custom S3)
 # Uses environment AWS_* credentials and optional CBOB_SOURCE_ENDPOINT
 # Usage: aws_source_cmd s3 sync source dest
@@ -586,6 +702,9 @@ sync_to_dest() {
 
         mkdir -p "$cache_dir"
 
+        # Start aggregating warnings to avoid Slack spam
+        start_warning_aggregation "S3 sync to $dest_subpath"
+
         while IFS= read -r file || [ -n "$file" ]; do
             [ -z "$file" ] && continue
             echo "$file" >> "$batch_file"
@@ -594,6 +713,10 @@ sync_to_dest() {
             # Process batch when reaching batch_size or end of file
             if [ $((synced % batch_size)) -eq 0 ]; then
                 ((batch_num++))
+
+                # Check and refresh credentials before each batch to prevent STS token expiration
+                maybe_refresh_credentials
+
                 info "  Downloading batch $batch_num ($batch_size files, $synced / $diff_count total)..."
 
                 # Build --include arguments for aws s3 sync
@@ -604,14 +727,15 @@ sync_to_dest() {
                 done < "$batch_file"
 
                 # Download batch using aws s3 sync (parallel transfers!)
+                # Use warn_silent to aggregate failures instead of spamming Slack
                 aws_source_cmd s3 sync "$source_url" "$cache_dir" "${include_args[@]}" 2>/dev/null || {
-                    warning "Failed to download batch $batch_num"
+                    warn_silent "Failed to download batch $batch_num"
                 }
 
                 # Upload batch to destination
                 info "  Uploading batch $batch_num to destination..."
                 aws_dest_cmd s3 sync "$cache_dir" "$dest_path" --quiet 2>/dev/null || {
-                    warning "Failed to upload batch $batch_num to destination: $dest_path"
+                    warn_silent "Failed to upload batch $batch_num to destination: $dest_path"
                 }
 
                 # Clean cache and batch file for next iteration
@@ -624,6 +748,10 @@ sync_to_dest() {
         local remaining=$(wc -l < "$batch_file" | tr -d ' ')
         if [ "$remaining" -gt 0 ]; then
             ((batch_num++))
+
+            # Check and refresh credentials before final batch
+            maybe_refresh_credentials
+
             info "  Downloading final batch $batch_num ($remaining files)..."
 
             local include_args=("--exclude" "*")
@@ -633,15 +761,17 @@ sync_to_dest() {
             done < "$batch_file"
 
             aws_source_cmd s3 sync "$source_url" "$cache_dir" "${include_args[@]}" 2>/dev/null || {
-                warning "Failed to download final batch"
+                warn_silent "Failed to download final batch"
             }
 
             info "  Uploading final batch to destination..."
             aws_dest_cmd s3 sync "$cache_dir" "$dest_path" --quiet 2>/dev/null || {
-                warning "Failed to upload final batch to destination: $dest_path"
-                return 1
+                warn_silent "Failed to upload final batch to destination: $dest_path"
             }
         fi
+
+        # Send aggregated warning summary if there were failures
+        flush_warnings
 
         info "Synced $synced files in $batch_num batches (batch size: $batch_size)"
 
@@ -832,10 +962,11 @@ elif [ -f "/usr/local/lib/cbob/cbob_security.sh" ]; then
 fi
 
 # Export all functions
-export -f log_message debug info warning error notify
+export -f log_message debug info warning error notify warn_silent start_warning_aggregation flush_warnings
 export -f _cleanup_lock acquire_lock release_lock load_config validate_config
 export -f check_dependencies retry_with_backoff send_heartbeat
 export -f show_progress human_readable_size
 export -f is_dest_s3 validate_dest_s3_config aws_source_cmd aws_dest_cmd get_dest_path
+export -f mark_source_credentials_fresh needs_credential_refresh refresh_source_credentials maybe_refresh_credentials
 export -f upload_files_to_s3 sync_to_dest copy_to_dest list_dest dest_exists get_dest_size
 export -f sync_metadata_file download_from_dest
