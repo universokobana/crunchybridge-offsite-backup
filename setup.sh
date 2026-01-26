@@ -1,10 +1,14 @@
 #!/bin/bash
 
 # Author: Rafael Lima (https://github.com/rafaelp)
-# Updated for v2 architecture with non-interactive mode support
+# Updated for v2.1 architecture with non-interactive mode support
+# Requires: pgBackRest 2.58+ for native STS token refresh
 
 # terminate script as soon as any command fails
 set -e
+
+# Minimum required pgBackRest version
+MIN_PGBACKREST_VERSION="2.58"
 
 # Colors for output
 RED='\033[0;31m'
@@ -30,6 +34,29 @@ function error(){
     echo -e "${RED}$(date "+%F %T") ERROR:${NC} $msg"
     logger -p user.error -t "$(basename "$0")" "$msg" 2>/dev/null || true
     exit 1
+}
+
+# Check pgBackRest version meets minimum requirement
+function check_pgbackrest_version(){
+    if ! command -v pgbackrest &> /dev/null; then
+        warning "pgBackRest not found after installation"
+        return 1
+    fi
+
+    local version=$(pgbackrest version | grep -oE '[0-9]+\.[0-9]+' | head -1)
+    local major=$(echo "$version" | cut -d. -f1)
+    local minor=$(echo "$version" | cut -d. -f2)
+    local min_major=$(echo "$MIN_PGBACKREST_VERSION" | cut -d. -f1)
+    local min_minor=$(echo "$MIN_PGBACKREST_VERSION" | cut -d. -f2)
+
+    if [ "$major" -lt "$min_major" ] || ([ "$major" -eq "$min_major" ] && [ "$minor" -lt "$min_minor" ]); then
+        warning "pgBackRest $version is installed, but $MIN_PGBACKREST_VERSION+ is required for native STS token refresh."
+        warning "Please upgrade: apt update && apt install pgbackrest"
+        return 1
+    fi
+
+    info "pgBackRest $version detected (>= $MIN_PGBACKREST_VERSION required) ✓"
+    return 0
 }
 
 # Check for non-interactive mode
@@ -248,6 +275,9 @@ if [ "$SKIP_DEPS" != "true" ]; then
 
     info "Installing PostgreSQL $CBOB_PG_VERSION and pgBackRest"
     apt install -y postgresql-$CBOB_PG_VERSION postgresql-client-$CBOB_PG_VERSION pgbackrest
+
+    # Verify pgBackRest version
+    check_pgbackrest_version || warning "pgBackRest version check failed - STS token refresh may not work"
 
     # Install pgaudit if available
     apt install -y postgresql-$CBOB_PG_VERSION-pgaudit 2>/dev/null || warning "pgaudit not available, skipping"

@@ -1,10 +1,14 @@
 #!/bin/bash
 
-# CBOB Install Script - v2
+# CBOB Install Script - v2.1
 # Installs CBOB CLI and libraries to the system
 # For full setup with dependency installation, use setup.sh
+# Requires: pgBackRest 2.58+ for native STS token refresh
 
 set -euo pipefail
+
+# Minimum required pgBackRest version
+MIN_PGBACKREST_VERSION="2.58"
 
 # Colors for output
 RED='\033[0;31m'
@@ -23,6 +27,30 @@ warning() {
 error() {
     echo -e "${RED}[ERROR]${NC} $1"
     exit 1
+}
+
+# Check pgBackRest version
+check_pgbackrest_version() {
+    if ! command -v pgbackrest &> /dev/null; then
+        warning "pgBackRest not found. Please install pgBackRest $MIN_PGBACKREST_VERSION or later."
+        warning "CBOB 2.1+ requires pgBackRest 2.58+ for native STS token refresh."
+        return 1
+    fi
+
+    local version=$(pgbackrest version | grep -oE '[0-9]+\.[0-9]+' | head -1)
+    local major=$(echo "$version" | cut -d. -f1)
+    local minor=$(echo "$version" | cut -d. -f2)
+    local min_major=$(echo "$MIN_PGBACKREST_VERSION" | cut -d. -f1)
+    local min_minor=$(echo "$MIN_PGBACKREST_VERSION" | cut -d. -f2)
+
+    if [ "$major" -lt "$min_major" ] || ([ "$major" -eq "$min_major" ] && [ "$minor" -lt "$min_minor" ]); then
+        warning "pgBackRest $version is installed, but $MIN_PGBACKREST_VERSION+ is required."
+        warning "Please upgrade: apt update && apt install pgbackrest"
+        return 1
+    fi
+
+    info "pgBackRest $version detected (>= $MIN_PGBACKREST_VERSION required) ✓"
+    return 0
 }
 
 # Check if running as root
@@ -129,6 +157,9 @@ install_v2() {
 
     # Set ownership for postgres user
     chown -R postgres:postgres "$LIB_DIR" 2>/dev/null || true
+
+    # Check pgBackRest version
+    check_pgbackrest_version || warning "CBOB installed but pgBackRest version check failed"
 
     info "Installation complete!"
 }
