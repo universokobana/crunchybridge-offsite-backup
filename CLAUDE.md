@@ -4,11 +4,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Crunchy Bridge Off-site Backup (CBOB) v2.0 is a comprehensive backup management system that syncs AWS S3 backups from Crunchy Bridge to local or alternative cloud storage. It provides automated backup synchronization, validation, multi-cloud replication, and restoration capabilities using pgBackRest.
+Crunchy Bridge Off-site Backup (CBOB) v2.1 is a comprehensive backup management system that syncs AWS S3 backups from Crunchy Bridge to local or alternative cloud storage. It provides automated backup synchronization, validation, multi-cloud replication, and restoration capabilities using pgBackRest.
 
-**Version:** 2.0.0
+**Version:** 2.1.0
 **Platform:** Debian 11/12 (target), with Docker support
 **Language:** Bash
+**pgBackRest:** 2.58+ required (native STS token refresh)
 
 ## Project Structure
 
@@ -254,7 +255,7 @@ $CBOB_BASE_PATH/
 ## Dependencies
 
 - Bash 3.2+
-- pgBackRest
+- pgBackRest 2.58+ (required for native STS token refresh)
 - AWS CLI v2
 - PostgreSQL 17 or 18
 - jq

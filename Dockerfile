@@ -2,7 +2,7 @@ FROM debian:11-slim
 
 LABEL maintainer="KOBANA INSTITUICAO DE PAGAMENTO LTDA"
 LABEL description="Crunchy Bridge Off-site Backup (CBOB) Docker Image"
-LABEL version="2.0.0"
+LABEL version="2.1.0"
 
 # Set environment variables
 ENV DEBIAN_FRONTEND=noninteractive
@@ -32,14 +32,16 @@ RUN curl -s "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscl
     && ./aws/install \
     && rm -rf ./aws awscliv2.zip
 
-# Add PostgreSQL repository and install pgBackRest
+# Add PostgreSQL repository and install pgBackRest 2.58+
+# pgBackRest 2.58.0 adds native STS token refresh, eliminating need for manual credential management
 RUN curl https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor | tee /etc/apt/trusted.gpg.d/apt.postgresql.org.gpg >/dev/null \
     && echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
         postgresql-client-18 \
         pgbackrest \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && pgbackrest version | grep -E "pgBackRest (2\.(5[8-9]|[6-9][0-9])|[3-9]\.)" || echo "WARNING: pgBackRest < 2.58 detected, some features may not work optimally"
 
 # Create postgres user and directories
 RUN useradd -m -s /bin/bash postgres \

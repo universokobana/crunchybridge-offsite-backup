@@ -400,9 +400,7 @@ sync_cluster() {
     export AWS_SESSION_TOKEN=$(echo "$credentials" | jq -r '.aws.s3_token')
     export AWS_ACCESS_KEY_ID=$(echo "$credentials" | jq -r '.aws.s3_key')
     export AWS_SECRET_ACCESS_KEY=$(echo "$credentials" | jq -r '.aws.s3_key_secret')
-
-    # Mark credentials as fresh for automatic refresh during long syncs
-    mark_source_credentials_fresh "$cluster_id"
+    # Note: STS token refresh is handled natively by pgBackRest 2.58+
 
     local bucket=$(echo "$credentials" | jq -r '.aws.s3_bucket')
     local repo_path=$(echo "$credentials" | jq -r '.repo_path')

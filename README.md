@@ -6,6 +6,12 @@ An off-site backup is a copy of a business production system data that is stored
 
 Altough this script was created specific for Crunchy Bridge it can bem adapted to work with any provider that work with pgBackRest.
 
+## What's New in v2.1
+
+- **pgBackRest 2.58+ Required**: Native STS token refresh eliminates manual credential management
+- **Simplified Codebase**: Removed ~70 lines of token refresh workaround code
+- **More Reliable Long Syncs**: pgBackRest handles token expiration automatically
+
 ## What's New in v2
 
 - **Unified CLI**: Single `cbob` command with subcommands for all operations
