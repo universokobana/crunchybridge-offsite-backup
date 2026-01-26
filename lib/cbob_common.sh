@@ -557,7 +557,8 @@ upload_files_to_s3() {
 
 # Sync from source S3 to destination (local or S3)
 # Usage: sync_to_dest source_s3_url dest_subpath [additional_aws_args...]
-# Uses aws s3 sync with --include patterns for parallel downloads (much faster)
+# For S3 destination: uses batched approach with --include patterns
+# For large datasets (>5000 files): uses chunked sync by subdirectory for better performance
 sync_to_dest() {
     local source_url="$1"
     local dest_subpath="$2"
@@ -572,10 +573,9 @@ sync_to_dest() {
         # For S3-to-S3 sync via local cache:
         # 1. List files in destination and source
         # 2. Calculate diff (files in source not in destination)
-        # 3. Download diff in batches using aws s3 sync with --include (parallel!)
+        # 3. Download diff in batches
         # 4. Upload batch to destination
         # 5. Clean cache and repeat
-        # This uses AWS CLI's internal parallelism for much faster transfers
 
         local cache_dir="${CBOB_TARGET_PATH}${dest_subpath}"
         local source_list=$(mktemp)
@@ -617,82 +617,126 @@ sync_to_dest() {
 
         info "Found $diff_count new files to sync"
 
-        # Process files in batches using aws s3 sync with --include patterns
-        # This leverages AWS CLI's internal parallelism (default 10 concurrent requests)
-        local batch_size="${CBOB_SYNC_BATCH_SIZE:-1000}"
-        local synced=0
-        local batch_num=0
-        local batch_file=$(mktemp)
-        trap "rm -f $source_list $dest_list $diff_list $batch_file" RETURN
-
         mkdir -p "$cache_dir"
 
         # Start aggregating warnings to avoid Slack spam
         start_warning_aggregation "S3 sync to $dest_subpath"
 
-        while IFS= read -r file || [ -n "$file" ]; do
-            [ -z "$file" ] && continue
-            echo "$file" >> "$batch_file"
-            ((synced++))
+        # For very large directories (>5000 files), use chunked sync by subdirectory
+        # This avoids the --include pattern performance issue
+        local large_threshold="${CBOB_SYNC_LARGE_THRESHOLD:-5000}"
+        if [ "$diff_count" -gt "$large_threshold" ]; then
+            info "Large dataset detected ($diff_count files > $large_threshold threshold)"
+            info "Using chunked sync by subdirectory for better performance..."
 
-            # Process batch when reaching batch_size or end of file
-            if [ $((synced % batch_size)) -eq 0 ]; then
+            # Extract unique subdirectories from diff list
+            local subdirs=$(mktemp)
+            trap "rm -f $source_list $dest_list $diff_list $subdirs" RETURN
+            cut -d'/' -f1-2 "$diff_list" | sort -u > "$subdirs"
+            local subdir_count=$(wc -l < "$subdirs" | tr -d ' ')
+
+            info "Found $subdir_count subdirectories to sync"
+
+            local synced_dirs=0
+            while IFS= read -r subdir || [ -n "$subdir" ]; do
+                [ -z "$subdir" ] && continue
+                ((synced_dirs++))
+
+                info "  [$synced_dirs/$subdir_count] Syncing subdirectory: $subdir"
+
+                # Sync entire subdirectory (AWS CLI handles incremental)
+                local subdir_cache="${cache_dir}/${subdir}"
+                mkdir -p "$subdir_cache"
+
+                aws_source_cmd s3 sync "${source_url}/${subdir}" "$subdir_cache" 2>/dev/null || {
+                    warn_silent "Failed to download subdirectory: $subdir"
+                    continue
+                }
+
+                # Upload to destination
+                aws_dest_cmd s3 sync "$subdir_cache" "${dest_path}/${subdir}" --quiet 2>/dev/null || {
+                    warn_silent "Failed to upload subdirectory to destination: $subdir"
+                }
+
+                # Clean cache for this subdirectory
+                rm -rf "${subdir_cache:?}"
+            done < "$subdirs"
+
+            # Send aggregated warning summary if there were failures
+            flush_warnings
+            info "Synced $subdir_count subdirectories"
+        else
+            # For smaller datasets, use batch approach with --include patterns
+            # Reduced default batch size from 1000 to 100 for faster pattern matching
+            local batch_size="${CBOB_SYNC_BATCH_SIZE:-100}"
+            local synced=0
+            local batch_num=0
+            local batch_file=$(mktemp)
+            trap "rm -f $source_list $dest_list $diff_list $batch_file" RETURN
+
+            while IFS= read -r file || [ -n "$file" ]; do
+                [ -z "$file" ] && continue
+                echo "$file" >> "$batch_file"
+                ((synced++))
+
+                # Process batch when reaching batch_size or end of file
+                if [ $((synced % batch_size)) -eq 0 ]; then
+                    ((batch_num++))
+
+                    info "  Downloading batch $batch_num ($batch_size files, $synced / $diff_count total)..."
+
+                    # Build --include arguments for aws s3 sync
+                    local include_args=("--exclude" "*")
+                    while IFS= read -r pattern; do
+                        [ -z "$pattern" ] && continue
+                        include_args+=("--include" "$pattern")
+                    done < "$batch_file"
+
+                    # Download batch using aws s3 sync (parallel transfers!)
+                    aws_source_cmd s3 sync "$source_url" "$cache_dir" "${include_args[@]}" 2>/dev/null || {
+                        warn_silent "Failed to download batch $batch_num"
+                    }
+
+                    # Upload batch to destination
+                    info "  Uploading batch $batch_num to destination..."
+                    aws_dest_cmd s3 sync "$cache_dir" "$dest_path" --quiet 2>/dev/null || {
+                        warn_silent "Failed to upload batch $batch_num to destination: $dest_path"
+                    }
+
+                    # Clean cache and batch file for next iteration
+                    rm -rf "${cache_dir:?}"/*
+                    > "$batch_file"
+                fi
+            done < "$diff_list"
+
+            # Process remaining files in final batch
+            local remaining=$(wc -l < "$batch_file" | tr -d ' ')
+            if [ "$remaining" -gt 0 ]; then
                 ((batch_num++))
 
-                info "  Downloading batch $batch_num ($batch_size files, $synced / $diff_count total)..."
+                info "  Downloading final batch $batch_num ($remaining files)..."
 
-                # Build --include arguments for aws s3 sync
                 local include_args=("--exclude" "*")
                 while IFS= read -r pattern; do
                     [ -z "$pattern" ] && continue
                     include_args+=("--include" "$pattern")
                 done < "$batch_file"
 
-                # Download batch using aws s3 sync (parallel transfers!)
-                # Use warn_silent to aggregate failures instead of spamming Slack
                 aws_source_cmd s3 sync "$source_url" "$cache_dir" "${include_args[@]}" 2>/dev/null || {
-                    warn_silent "Failed to download batch $batch_num"
+                    warn_silent "Failed to download final batch"
                 }
 
-                # Upload batch to destination
-                info "  Uploading batch $batch_num to destination..."
+                info "  Uploading final batch to destination..."
                 aws_dest_cmd s3 sync "$cache_dir" "$dest_path" --quiet 2>/dev/null || {
-                    warn_silent "Failed to upload batch $batch_num to destination: $dest_path"
+                    warn_silent "Failed to upload final batch to destination: $dest_path"
                 }
-
-                # Clean cache and batch file for next iteration
-                rm -rf "${cache_dir:?}"/*
-                > "$batch_file"
             fi
-        done < "$diff_list"
 
-        # Process remaining files in final batch
-        local remaining=$(wc -l < "$batch_file" | tr -d ' ')
-        if [ "$remaining" -gt 0 ]; then
-            ((batch_num++))
+            # Send aggregated warning summary if there were failures
+            flush_warnings
 
-            info "  Downloading final batch $batch_num ($remaining files)..."
-
-            local include_args=("--exclude" "*")
-            while IFS= read -r pattern; do
-                [ -z "$pattern" ] && continue
-                include_args+=("--include" "$pattern")
-            done < "$batch_file"
-
-            aws_source_cmd s3 sync "$source_url" "$cache_dir" "${include_args[@]}" 2>/dev/null || {
-                warn_silent "Failed to download final batch"
-            }
-
-            info "  Uploading final batch to destination..."
-            aws_dest_cmd s3 sync "$cache_dir" "$dest_path" --quiet 2>/dev/null || {
-                warn_silent "Failed to upload final batch to destination: $dest_path"
-            }
+            info "Synced $synced files in $batch_num batches (batch size: $batch_size)"
         fi
-
-        # Send aggregated warning summary if there were failures
-        flush_warnings
-
-        info "Synced $synced files in $batch_num batches (batch size: $batch_size)"
 
         # Clean cache after all uploads
         debug "Cleaning cache: $cache_dir"
