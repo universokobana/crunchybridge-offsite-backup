@@ -310,9 +310,10 @@ mkdir -p /tmp/pgbackrest
 chown postgres:postgres -R /tmp/pgbackrest
 
 info "Creating CBOB directories"
-# Main directories - use 755 to allow postgres to traverse
+# Main directories - owned by postgres for sync tracking and temp files
 mkdir -p "$CBOB_BASE_PATH"
 chmod 755 "$CBOB_BASE_PATH"
+chown postgres:postgres "$CBOB_BASE_PATH"
 
 # Sync directory (used by cbob_sync)
 mkdir -p "$CBOB_BASE_PATH/crunchybridge/archive"
@@ -351,6 +352,13 @@ chown postgres:postgres "$CBOB_BASE_PATH/metrics"
 mkdir -p "$CBOB_BASE_PATH/config"
 chmod 750 "$CBOB_BASE_PATH/config"
 chown postgres:postgres "$CBOB_BASE_PATH/config"
+
+# Sync tracking file (for prioritizing clusters by last sync time)
+if [ ! -f "$CBOB_BASE_PATH/sync_tracking.json" ]; then
+    echo "{}" > "$CBOB_BASE_PATH/sync_tracking.json"
+fi
+chmod 664 "$CBOB_BASE_PATH/sync_tracking.json"
+chown postgres:postgres "$CBOB_BASE_PATH/sync_tracking.json"
 
 # Set Slack environment variables
 if [ -n "${CBOB_SLACK_CLI_TOKEN:-}" ]; then

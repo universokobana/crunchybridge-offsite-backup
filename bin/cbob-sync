@@ -319,14 +319,22 @@ update_sync_tracking() {
     fi
 
     # Update the tracking for this cluster
-    local tmp_file=$(mktemp)
-    jq --arg id "$cluster_id" \
-       --argjson ts "$timestamp" \
-       --arg dt "$datetime" \
-       '.[$id] = {"last_sync": $ts, "last_sync_datetime": $dt}' \
-       "$tracking_file" > "$tmp_file" && mv "$tmp_file" "$tracking_file"
-
-    debug "Updated sync tracking for cluster $cluster_id"
+    # Note: Create temp file in same directory to avoid cross-filesystem mv issues
+    local tmp_file="${tracking_file}.tmp.$$"
+    if jq --arg id "$cluster_id" \
+          --argjson ts "$timestamp" \
+          --arg dt "$datetime" \
+          '.[$id] = {"last_sync": $ts, "last_sync_datetime": $dt}' \
+          "$tracking_file" > "$tmp_file" 2>/dev/null; then
+        mv "$tmp_file" "$tracking_file" 2>/dev/null || {
+            # Fallback: use cp if mv fails (cross-filesystem)
+            cp "$tmp_file" "$tracking_file" && rm -f "$tmp_file"
+        }
+        debug "Updated sync tracking for cluster $cluster_id"
+    else
+        warning "Failed to update sync tracking for cluster $cluster_id"
+        rm -f "$tmp_file" 2>/dev/null
+    fi
 }
 
 # Sort clusters by last sync time (oldest first)
