@@ -4,7 +4,7 @@
 # This library provides shared functionality for logging, notifications, and error handling
 
 # Global variables
-CBOB_VERSION="2.1.0"
+CBOB_VERSION="2.1.1"
 CBOB_LOG_FORMAT="${CBOB_LOG_FORMAT:-text}"  # text or json
 CBOB_LOG_LEVEL="${CBOB_LOG_LEVEL:-info}"    # debug, info, warning, error
 

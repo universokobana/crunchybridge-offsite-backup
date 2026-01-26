@@ -6,6 +6,12 @@ An off-site backup is a copy of a business production system data that is stored
 
 Altough this script was created specific for Crunchy Bridge it can bem adapted to work with any provider that work with pgBackRest.
 
+## What's New in v2.1.1
+
+- **Chunked Sync for Large Datasets**: S3-to-S3 sync now automatically detects large datasets (>5000 files) and switches to subdirectory-based sync, avoiding AWS CLI pattern matching overhead that caused syncs to hang
+- **Performance Fix**: Syncs that were stuck at 96% CPU now run at ~63 MiB/s
+- **Configurable Thresholds**: New `CBOB_SYNC_BATCH_SIZE` and `CBOB_SYNC_LARGE_THRESHOLD` variables
+
 ## What's New in v2.1
 
 - **pgBackRest 2.58+ Required**: Native STS token refresh eliminates manual credential management

@@ -208,9 +208,9 @@ echo "test" | aws --endpoint-url "$CBOB_DEST_ENDPOINT" s3 cp - "s3://$CBOB_DEST_
 
 1. Check lock file:
 ```bash
-ls -la /var/lock/cbob_sync.lock
+ls -la /tmp/cbob_sync.lock
 # Remove stale lock
-rm -f /var/lock/cbob_sync.lock
+rm -f /tmp/cbob_sync.lock
 ```
 
 2. Enable debug mode:
@@ -222,6 +222,57 @@ cbob sync --log-level debug
 ```bash
 # Test S3 connectivity
 aws s3 ls s3://crunchy-backups-us-east-1/
+```
+
+### S3-to-S3 Sync Stuck at High CPU (Large Datasets)
+
+**Problem:** When `CBOB_DEST_TYPE=s3`, sync appears stuck with high CPU usage but no files being downloaded
+
+**Symptoms:**
+- AWS CLI process at 90-100% CPU
+- Log shows "Completed X GiB/~Y GiB ... calculating..." repeating forever
+- No network activity despite CPU usage
+- Typically affects clusters with large WAL archives (100k+ files)
+
+**Root Cause:**
+
+For S3-to-S3 sync, CBOB uses `aws s3 sync --exclude * --include file1 --include file2...` to download files in batches. With many include patterns (1000+), AWS CLI spends all CPU time on regex pattern matching instead of actual file transfer.
+
+**Solutions:**
+
+1. **Use CBOB v2.1.1+** (automatic fix):
+   - Detects large datasets (>5000 files)
+   - Switches to chunked sync by subdirectory
+   - Much faster: ~63 MiB/s vs stuck at 0 MiB/s
+
+2. **Adjust thresholds** (if needed):
+```bash
+# Lower threshold triggers chunked sync earlier
+export CBOB_SYNC_LARGE_THRESHOLD=2000
+
+# Smaller batch size for pattern-based sync
+export CBOB_SYNC_BATCH_SIZE=50
+```
+
+3. **Manual recovery** (kill stuck process):
+```bash
+# Find and kill stuck AWS process
+pkill -9 -f 'aws s3 sync'
+
+# Remove lock and restart
+rm -f /tmp/cbob_sync.lock
+sudo -u postgres cbob sync
+```
+
+**Monitoring Progress:**
+
+With chunked sync, you'll see progress like:
+```
+INFO: Large dataset detected (385131 files > 5000 threshold)
+INFO: Using chunked sync by subdirectory for better performance...
+INFO: Found 1509 subdirectories to sync
+INFO:   [1/1509] Syncing subdirectory: 18-1/00000001000097C1
+INFO:   [2/1509] Syncing subdirectory: 18-1/00000001000097C2
 ```
 
 ### Bandwidth Issues

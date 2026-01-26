@@ -6,10 +6,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Crunchy Bridge Off-site Backup (CBOB) v2.1 is a comprehensive backup management system that syncs AWS S3 backups from Crunchy Bridge to local or alternative cloud storage. It provides automated backup synchronization, validation, multi-cloud replication, and restoration capabilities using pgBackRest.
 
-**Version:** 2.1.0
+**Version:** 2.1.1
 **Platform:** Debian 11/12 (target), with Docker support
 **Language:** Bash
 **pgBackRest:** 2.58+ required (native STS token refresh)
+
+### Recent Changes (v2.1.1)
+- **Chunked sync for large datasets**: S3-to-S3 sync now automatically detects large datasets (>5000 files) and switches to subdirectory-based sync to avoid AWS CLI pattern matching overhead
+- **Reduced batch size**: Default batch size reduced from 1000 to 100 for faster pattern matching on smaller datasets
 
 ## Project Structure
 
@@ -216,6 +220,11 @@ Configuration is loaded from (in order):
 - `CBOB_RESTORE_PARALLEL` - Parallel restore workers
 - `CBOB_LOG_LEVEL` - debug, info, warning, error
 - `CBOB_LOG_FORMAT` - text, json
+
+### S3-to-S3 Sync Performance
+
+- `CBOB_SYNC_BATCH_SIZE` - Batch size for include-pattern sync (default: 100)
+- `CBOB_SYNC_LARGE_THRESHOLD` - Files count threshold for chunked sync (default: 5000)
 
 ## Runtime Directory Structure
 

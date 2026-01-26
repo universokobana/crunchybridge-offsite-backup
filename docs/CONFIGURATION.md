@@ -178,6 +178,15 @@ CBOB_REPLICATION_BANDWIDTH=5MB/s
 CBOB_RETRY_COUNT=3
 CBOB_RETRY_DELAY=10
 CBOB_RETRY_MAX_DELAY=300
+
+# S3-to-S3 Sync Performance (when CBOB_DEST_TYPE=s3)
+# Batch size for include-pattern sync (smaller = faster pattern matching)
+CBOB_SYNC_BATCH_SIZE=100
+
+# Threshold for switching to chunked sync by subdirectory
+# For datasets larger than this, syncs entire subdirectories instead of individual files
+# This avoids AWS CLI pattern matching overhead for large WAL archives
+CBOB_SYNC_LARGE_THRESHOLD=5000
 ```
 
 ### Security Settings
